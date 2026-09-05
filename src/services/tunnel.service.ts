@@ -125,22 +125,31 @@ class TunnelService {
   /** Get current tunnel URL (null if not running).
    *  Falls back to status.json if the supervisor set the URL after this process started. */
   getTunnelUrl(): string | null {
-    if (this.url) return this.url;
-    // Lazy sync: supervisor may have written shareUrl after server startup
+    // A tunnel this process spawned can only change through this class, so its
+    // URL is safe to cache. A supervisor-managed one is not: the supervisor
+    // rewrites shareUrl on its own (quick-URL regeneration, switching to or
+    // from a named hostname) and the server would otherwise keep handing out
+    // the first URL it ever saw — the share popover and the cloud heartbeat
+    // both showed a dead temporary URL minutes after the hostname went live.
+    if (this.childProcess && this.url) return this.url;
     this.syncFromStatusFile();
     return this.url;
   }
 
   /** Re-read tunnel state from status.json (supervisor may have updated it after server started) */
   private syncFromStatusFile(): void {
-    if (this.url) return; // already have a URL
+    if (this.childProcess) return; // we own this tunnel; status.json mirrors us, not the other way round
     try {
       const statusFile = resolve(getPpmDir(), "status.json");
       const status = JSON.parse(readFileSync(statusFile, "utf-8"));
       if (status.shareUrl) {
+        const changed = status.shareUrl !== this.url;
         this.url = status.shareUrl;
         this.supervisorManaged = true;
         if (status.tunnelPid) this.externalPid = status.tunnelPid;
+        // A new public URL must reach PPM Cloud too, or the permanent link
+        // keeps redirecting to the retired one.
+        if (changed) this.syncToCloud();
       }
     } catch {}
   }

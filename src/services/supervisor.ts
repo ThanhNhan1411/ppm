@@ -1002,7 +1002,17 @@ function startServerHealthCheck() {
  */
 async function probeNamedTunnelHealth(): Promise<boolean> {
   try {
-    const publicRes = await fetch(`${tunnelUrl}/api/health`, { signal: AbortSignal.timeout(10_000) });
+    // `Connection: close` is load-bearing: this probe runs every 30s for the
+    // life of the supervisor, and a pooled keep-alive socket pins us to
+    // whatever IP the hostname resolved to when the pool opened it. Observed
+    // live: after a deleted CNAME fell back to the zone's wildcard host, the
+    // pooled socket kept answering from that host for minutes after the CNAME
+    // was restored — the probe never saw the recovery. A fresh connection per
+    // probe follows DNS.
+    const publicRes = await fetch(`${tunnelUrl}/api/health`, {
+      signal: AbortSignal.timeout(10_000),
+      headers: { connection: "close" },
+    });
     if (!publicRes.ok) return false;
     _resetTargetCache();
     const checkPort = resolveTargetPort();
@@ -1840,8 +1850,11 @@ export async function runSupervisor(opts: {
         log("INFO", "SIGUSR2: retunnel command received");
         namedTunnelMode = await readTunnelConfigFresh();
         // A deliberate corrective action (e.g. the user just fixed DNS) gets a
-        // fresh one-restart budget rather than inheriting a stale exhausted one.
+        // fresh one-restart budget rather than inheriting a stale exhausted one —
+        // both the flag and the fail counter, or a nearly-full counter carried
+        // over from the outage trips "restart once" after a handful of probes.
         namedProbeRestartAttempted = false;
+        tunnelFailCount = 0;
         restartTunnel(_opts.port);
         // Deliberate fall-through (no return): a bare `ppm restart` sends a
         // bare SIGUSR2 with no command file of its own, and a `retunnel` that
@@ -1975,8 +1988,9 @@ export async function runSupervisor(opts: {
         readTunnelConfigFresh().then((cfg) => {
           namedTunnelMode = cfg;
           // A deliberate corrective action gets a fresh one-restart budget
-          // rather than inheriting a stale exhausted one.
+          // rather than inheriting a stale exhausted one (flag AND counter).
           namedProbeRestartAttempted = false;
+          tunnelFailCount = 0;
           restartTunnel(_opts.port);
         });
       }

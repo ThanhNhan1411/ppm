@@ -9,6 +9,7 @@
 ### Changed
 - **Named tunnel setup requires `auth.enabled`** — the popup stays hidden and every mutating tunnel endpoint 403s while PPM auth is off.
 - **`~/.cloudflared` is now refused by the file browser API**, the same protection the PPM config directory already had, covering read/copy/move/upload.
+- **`ppm stop`/`ppm down` on Windows only kill this PPM's own cloudflared** — the old image-wide `taskkill` also took down every other cloudflared on the machine (another PPM instance, your own tunnels), rotating their URLs.
 - **Tunnel and auth secrets are masked wherever config is echoed back** — `ppm config get`, the extension RPC, and `ppm status` never print a raw token, even when an ancestor object (`tunnel`, `auth`) is requested.
 
 ## [0.18.12] - 2026-09-05

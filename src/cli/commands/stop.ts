@@ -19,6 +19,31 @@ function killPid(pid: number, label: string): boolean {
   }
 }
 
+/**
+ * PIDs of cloudflared processes spawned for THIS PPM_HOME: their command line
+ * carries `--config <ppmDir>/cloudflared-*.yml` (and usually the binary under
+ * `<ppmDir>/bin`). Anything else on the machine is not ours to kill.
+ */
+function findOwnCloudflaredPids(): number[] {
+  if (process.platform !== "win32") return [];
+  try {
+    const script =
+      `Get-CimInstance Win32_Process -Filter "Name='cloudflared.exe'" | ForEach-Object { "$($_.ProcessId)\`t$($_.CommandLine)" }`;
+    const result = Bun.spawnSync(
+      ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+      { stdout: "pipe", stderr: "ignore" },
+    );
+    const ppmDir = getPpmDir().replace(/\//g, "\\").toLowerCase();
+    return result.stdout.toString().split("\n")
+      .map((line) => line.trim().split("\t"))
+      .filter((parts) => parts.length >= 2 && (parts[1] ?? "").replace(/\//g, "\\").toLowerCase().includes(ppmDir))
+      .map((parts) => parseInt(parts[0]!, 10))
+      .filter((pid) => !isNaN(pid));
+  } catch {
+    return [];
+  }
+}
+
 function findPidsByName(name: string): number[] {
   try {
     if (process.platform === "win32") {
@@ -222,11 +247,14 @@ async function hardStop() {
     try { process.kill(tunnelPid, 0); killPid(tunnelPid, "tunnel"); } catch {}
   }
 
-  // Windows fallback: kill orphan cloudflared processes
+  // Windows fallback: kill orphan cloudflared processes — but only OURS.
+  // `taskkill /IM cloudflared.exe` would also take down every other
+  // cloudflared on the box: a second PPM_HOME instance, the user's own named
+  // tunnels, or another PPM's production tunnel (which then rotates its URL).
+  // Our processes are recognisable by the config/binary path under this
+  // PPM_HOME, so match on that and kill by exact PID.
   if (process.platform === "win32") {
-    try {
-      Bun.spawnSync(["taskkill", "/F", "/IM", "cloudflared.exe"], { stdout: "ignore", stderr: "ignore" });
-    } catch {}
+    for (const pid of findOwnCloudflaredPids()) killPid(pid, "orphan tunnel");
     // process.kill on Windows is TerminateProcess — the supervisor's shutdown
     // handler never runs, so its server grandchildren survive and keep the
     // inherited listening-socket handle open (zombie port). Reap them here.

@@ -4,6 +4,8 @@ import { QRCodeSVG } from "qrcode.react";
 import { api } from "@/lib/api-client";
 import { copyToClipboard } from "@/lib/clipboard";
 import { CloudAliasRow } from "./cloud-alias-row";
+import { CloudShareNamedTunnelRow } from "./cloud-share-named-tunnel-row";
+import type { NamedTunnelStatus } from "@/lib/api-named-tunnel";
 
 interface CloudStatus {
   logged_in: boolean;
@@ -39,20 +41,28 @@ export function CloudSharePopover({ onClose, variant = "popover" }: Props) {
   const [copied, setCopied] = useState<string | null>(null);
   const [deviceCode, setDeviceCode] = useState<{ userCode: string; verifyUrl: string } | null>(null);
   const [loginPolling, setLoginPolling] = useState(false);
+  // A live named tunnel means the public URL is already permanent — the
+  // "this link changes on restart" pitch would be false.
+  const [namedLive, setNamedLive] = useState(false);
+
+  const reloadStatus = useCallback(async () => {
+    try {
+      const [cloudRes, tunnelRes] = await Promise.all([
+        api.get<CloudStatus>("/api/cloud/status"),
+        api.get<TunnelStatus>("/api/tunnel"),
+      ]);
+      setCloud(cloudRes);
+      setTunnel(tunnelRes);
+    } catch { /* ignore */ }
+  }, []);
 
   // Load status on mount
   useEffect(() => {
-    (async () => {
-      try {
-        const [cloudRes, tunnelRes] = await Promise.all([
-          api.get<CloudStatus>("/api/cloud/status"),
-          api.get<TunnelStatus>("/api/tunnel"),
-        ]);
-        setCloud(cloudRes);
-        setTunnel(tunnelRes);
-      } catch { /* ignore */ }
-      setLoading(false);
-    })();
+    reloadStatus().finally(() => setLoading(false));
+  }, [reloadStatus]);
+
+  const handleNamedStatus = useCallback((s: NamedTunnelStatus) => {
+    setNamedLive((s.liveMode ?? s.mode) === "named");
   }, []);
 
   const handleCopy = useCallback((url: string) => {
@@ -254,8 +264,9 @@ export function CloudSharePopover({ onClose, variant = "popover" }: Props) {
               <>
                 {shareUrl && (
                   <p className="text-[11px] text-muted-foreground leading-relaxed">
-                    This link changes every time PPM restarts. Sign in to get a permanent one
-                    that always points here — private to your account.
+                    {namedLive
+                      ? "This link is permanent — it lives on your own domain. Sign in to PPM Cloud to keep your devices in sync."
+                      : "This link changes every time PPM restarts. Sign in to get a permanent one that always points here — private to your account."}
                   </p>
                 )}
                 <button
@@ -263,7 +274,7 @@ export function CloudSharePopover({ onClose, variant = "popover" }: Props) {
                   className="w-full flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border border-border hover:bg-muted transition-colors"
                 >
                   <Cloud className="size-3.5" />
-                  {shareUrl ? "Get a permanent link" : "Sign in to PPM Cloud"}
+                  {shareUrl && !namedLive ? "Get a permanent link" : "Sign in to PPM Cloud"}
                 </button>
               </>
             )}
@@ -308,6 +319,9 @@ export function CloudSharePopover({ onClose, variant = "popover" }: Props) {
 
           {/* Separator */}
           <div className="border-t border-border" />
+
+          {/* Custom domain (named tunnel) on/off — only when one has been configured */}
+          <CloudShareNamedTunnelRow onStatus={handleNamedStatus} onTunnelChanged={reloadStatus} />
 
           {/* Local Network URL */}
           {tunnel?.localUrl && (

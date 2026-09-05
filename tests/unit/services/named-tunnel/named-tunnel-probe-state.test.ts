@@ -1,9 +1,27 @@
 import { describe, test, expect } from "bun:test";
 import {
-  decideNamedProbeAction, type NamedProbeState,
+  decideNamedProbeAction, publicHostnameIsOurs, type NamedProbeState,
 } from "../../../../src/services/named-tunnel/named-tunnel-probe-state.ts";
 
 const THRESHOLD = 3; // small threshold — the arithmetic is the same at any size
+
+describe("publicHostnameIsOurs", () => {
+  test("same instanceId on both sides is ours", () => {
+    expect(publicHostnameIsOurs("abc", "abc")).toBe(true);
+  });
+  test("different instanceId means another connector answers our hostname", () => {
+    expect(publicHostnameIsOurs("other", "abc")).toBe(false);
+  });
+  test("a 200 with no instanceId is NOT ours when our own server has one (wildcard fallback after CNAME deletion)", () => {
+    expect(publicHostnameIsOurs(undefined, "abc")).toBe(false);
+    expect(publicHostnameIsOurs(null, "abc")).toBe(false);
+    expect(publicHostnameIsOurs(42, "abc")).toBe(false);
+  });
+  test("falls back to bare reachability only when our own server has no instanceId", () => {
+    expect(publicHostnameIsOurs(undefined, undefined)).toBe(true);
+    expect(publicHostnameIsOurs("whatever", undefined)).toBe(true);
+  });
+});
 
 describe("decideNamedProbeAction", () => {
   test("unhealthy below threshold just watches, counting up", () => {

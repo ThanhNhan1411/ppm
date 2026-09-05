@@ -228,6 +228,19 @@ describe("named-tunnel-setup.service", () => {
       await expect(runSetup(HOSTNAME)).rejects.toThrow("unexpected cloudflared output");
       expect(configService.get("tunnel").mode).not.toBe("named");
     });
+
+    test("accepts a real-shaped token: standard base64 with '+', '/' and '=' padding", async () => {
+      // Shape observed from `cloudflared tunnel token` 2026.3.0: ~180 chars of
+      // standard (not URL-safe) base64, `=` terminated. Synthetic value — not a secret.
+      // 133 bytes → 180 base64 chars ending in "==" (133 mod 3 = 1), like the real token.
+      const realShaped = Buffer.alloc(133, 0xfb).toString("base64");
+      expect(realShaped.length).toBe(180);
+      expect(realShaped.endsWith("=")).toBe(true);
+      expect(/[+/]/.test(realShaped)).toBe(true);
+      runResults.set("token", { code: 0, stdout: `${realShaped}\n`, stderr: "" });
+      await runSetup(HOSTNAME);
+      expect(configService.get("tunnel").namedTunnelToken).toBe(realShaped);
+    });
   });
 
   describe("runSetup — persistence, and non-blocking confirmation", () => {

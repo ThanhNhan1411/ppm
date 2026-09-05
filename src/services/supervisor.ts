@@ -22,7 +22,7 @@ import {
 import type { ResolvedTunnelConfig, TunnelMode } from "./named-tunnel/named-tunnel-config.ts";
 import { readTunnelConfigFresh, chooseTunnelSpawn } from "./named-tunnel/named-tunnel-runtime.ts";
 import { waitForLogLine } from "./named-tunnel/named-tunnel-readiness.ts";
-import { decideNamedProbeAction } from "./named-tunnel/named-tunnel-probe-state.ts";
+import { decideNamedProbeAction, publicHostnameIsOurs } from "./named-tunnel/named-tunnel-probe-state.ts";
 import { isCloudflaredPid } from "./tunnel-registry.service.ts";
 import { getQuickTunnelArgs } from "./cloudflared.service.ts";
 import { startStoppedPage, stopStoppedPage } from "./supervisor-stopped-page.ts";
@@ -1011,10 +1011,9 @@ async function probeNamedTunnelHealth(): Promise<boolean> {
     const localRes = await fetch(`http://127.0.0.1:${checkPort}/api/health`, { signal: AbortSignal.timeout(5000) });
     if (!localRes.ok) return true; // our own server's health is startServerHealthCheck's job, not this probe's
     const localBody = await localRes.json().catch(() => null) as { data?: { instanceId?: unknown } } | null;
-    const publicId = publicBody?.data?.instanceId;
-    const localId = localBody?.data?.instanceId;
-    if (typeof publicId === "string" && typeof localId === "string") return publicId === localId;
-    return true; // instanceId not yet present on either side — reachability only
+    // A 200 alone proves nothing: a deleted CNAME falls back to the zone's
+    // wildcard record and an unrelated host answers. Identity decides.
+    return publicHostnameIsOurs(publicBody?.data?.instanceId, localBody?.data?.instanceId);
   } catch {
     return false;
   }

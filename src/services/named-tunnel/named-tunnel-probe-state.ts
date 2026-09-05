@@ -33,6 +33,22 @@ export interface NamedProbeDecision {
 }
 
 /**
+ * Is the thing answering the public hostname *our* server? `publicId` is the
+ * `instanceId` the hostname returned, `localId` the one our loopback server
+ * returned; either may be missing.
+ *
+ * A deleted CNAME does not make the hostname go dark — it falls back to the
+ * zone's wildcard record and some unrelated host answers 200 with a body that
+ * has no `instanceId`. If we know our own identity and the public answer lacks
+ * one (or differs), the hostname is not ours. Only when our own server has no
+ * identity (a build that predates `instanceId`) do we accept bare reachability.
+ */
+export function publicHostnameIsOurs(publicId: unknown, localId: unknown): boolean {
+  if (typeof localId !== "string") return true;
+  return typeof publicId === "string" && publicId === localId;
+}
+
+/**
  * Decide the next action for one probe tick.
  *
  * - `healthy` → both counters reset to a clean slate (the only place

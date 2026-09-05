@@ -114,7 +114,10 @@ export const app = new Hono();
 app.use("*", cors());
 
 // Public endpoints (before auth)
-app.get("/api/health", (c) => c.json(ok({ status: "running" })));
+// Per-boot id so a named-tunnel health probe can tell "my connector is dark"
+// from "someone else's connector answers my hostname" across a restart.
+const instanceId = crypto.randomUUID();
+app.get("/api/health", (c) => c.json(ok({ status: "running", instanceId })));
 app.get("/api/info", (c) => c.json(ok({
   version: VERSION,
   device_name: configService.get("device_name") || null,
@@ -180,6 +183,8 @@ app.route("/api/settings", settingsRoutes);
 app.route("/api/settings/mcp", mcpRoutes);
 app.route("/api/settings/themes", settingsThemesRoutes);
 app.route("/api/tunnel", tunnelRoutes);
+import { namedTunnelRoutes } from "./routes/named-tunnel.ts";
+app.route("/api/tunnel/named", namedTunnelRoutes);
 app.route("/api/projects", projectRoutes);
 app.route("/api/project/:projectName", projectScopedRouter);
 app.route("/api/postgres", postgresRoutes);
@@ -345,7 +350,12 @@ export async function startServer(options: {
                 signalSupervisor("SIGUSR1");
                 await waitForNewSupervisor(statusFile, supervisorPid);
               } else {
-                writeCmd("resume");
+                // resume is a lifecycle action and outranks a pending retunnel
+                // (writeCmd overwrites it), so `false` here means a genuinely
+                // different lifecycle command is already queued.
+                if (!writeCmd("resume")) {
+                  console.log("  Warning: another supervisor command is already pending; resume may be delayed.");
+                }
                 signalSupervisor("SIGUSR2", "resume");
                 await waitForServerReady(statusFile, port);
               }
@@ -367,7 +377,9 @@ export async function startServer(options: {
 
             if (state === "paused") {
               console.log("  Supervisor is paused (max restarts). Sending resume...");
-              writeCmd("resume");
+              if (!writeCmd("resume")) {
+                console.log("  Warning: another supervisor command is already pending; resume may be delayed.");
+              }
               signalSupervisor("SIGUSR2", "resume");
               await waitForServerReady(statusFile, port);
               return;

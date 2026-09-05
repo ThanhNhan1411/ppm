@@ -8,7 +8,7 @@ import type { Subprocess } from "bun";
 import { resolve } from "node:path";
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync, openSync, closeSync, appendFileSync,
-  unlinkSync,
+  unlinkSync, statSync,
 } from "node:fs";
 import { getPpmDir } from "./ppm-dir.ts";
 import { isCompiledBinary } from "./autostart-generator.ts";
@@ -19,6 +19,12 @@ import {
   readAndDeleteCmd, readStatus, updateStatus, writeStatus,
   STATUS_FILE, PID_FILE,
 } from "./supervisor-state.ts";
+import type { ResolvedTunnelConfig, TunnelMode } from "./named-tunnel/named-tunnel-config.ts";
+import { readTunnelConfigFresh, chooseTunnelSpawn } from "./named-tunnel/named-tunnel-runtime.ts";
+import { waitForLogLine } from "./named-tunnel/named-tunnel-readiness.ts";
+import { decideNamedProbeAction, publicHostnameIsOurs } from "./named-tunnel/named-tunnel-probe-state.ts";
+import { isCloudflaredPid } from "./tunnel-registry.service.ts";
+import { getQuickTunnelArgs } from "./cloudflared.service.ts";
 import { startStoppedPage, stopStoppedPage } from "./supervisor-stopped-page.ts";
 import { sdNotify } from "./sd-notify.ts";
 import {
@@ -43,6 +49,7 @@ const SERVER_REVIVE_AFTER_MS = 90_000;      // > BACKOFF_MAX_MS, so crash backof
 const TUNNEL_PROBE_INTERVAL_MS = 30_000;    // 30s — adopted tunnels have no `exited` promise
 const TUNNEL_ZOMBIE_THRESHOLD = 10;         // ~5min @ 30s probe — only regenerate a truly-zombied URL (process alive, edge dropped). cloudflared self-heals transient QUIC drops, so don't kill it early.
 const TUNNEL_URL_REGEX = /https:\/\/(?!api\.)[a-z0-9-]+\.trycloudflare\.com/;
+const NAMED_TUNNEL_READY_REGEX = /Registered tunnel connection/;
 const UPGRADE_CHECK_INTERVAL_MS = 900_000;  // 15min
 const UPGRADE_SKIP_INITIAL_MS = 300_000;    // 5min delay before first check
 const SELF_REPLACE_TIMEOUT_MS = 30_000;     // 30s to wait for new supervisor
@@ -80,6 +87,21 @@ let tunnelGeneration = 0;
 // failure while serving"). Never rotate more than once per this window.
 let lastTunnelRegenAt = 0;
 const TUNNEL_REGEN_MIN_INTERVAL_MS = 300_000; // 5min
+
+// Named-tunnel state. `namedTunnelMode` is a synchronous cache refreshed at
+// exactly three points (startup, start of spawnTunnel, retunnel dispatch) —
+// every OTHER reader (restartTunnel, adoptTunnel, the probe) must read this
+// cache, never `configService` (a separate process, stale here) nor a fresh
+// async DB read (would reorder the startup adopt/probe-before-spawn race).
+let namedTunnelMode: ResolvedTunnelConfig | null = null;
+// The mode of the tunnel actually spawned (as opposed to `namedTunnelMode`,
+// which is merely the persisted intent) — a token failure leaves config=named
+// but live=quick, and every status write / throttle / restart decision must
+// key off what's actually running.
+let lastSpawnMode: TunnelMode = "quick";
+// Set once the named probe has already tried a restart-and-hope; a second
+// consecutive failure then warns and stops instead of looping kills forever.
+let namedProbeRestartAttempted = false;
 
 // Module-level refs for softStop (needs access to respawn args)
 let _serverArgs: string[] = [];
@@ -268,7 +290,14 @@ function restartTunnel(port: number) {
   if (tunnelChild) { try { tunnelChild.kill(); } catch {} tunnelChild = null; }
   if (adoptedTunnelPid) { try { process.kill(adoptedTunnelPid, "SIGTERM"); } catch {} adoptedTunnelPid = null; }
   tunnelUrl = null;
-  updateStatus({ shareUrl: null, tunnelPid: null, tunnelPort: null });
+  if (lastSpawnMode === "named") {
+    // The named URL is pinned to the configured hostname — it must never
+    // flicker null mid-respawn, or every client watching status.json sees a
+    // dead share link for the few seconds the connector takes to reconnect.
+    updateStatus({ tunnelPid: null });
+  } else {
+    updateStatus({ shareUrl: null, tunnelPid: null, tunnelPort: null });
+  }
   spawnTunnel(port).catch((e) => log("ERROR", `restartTunnel failed: ${e}`));
 }
 
@@ -586,25 +615,16 @@ export async function spawnServer(
 const cloudflaredLogPath = () => resolve(getPpmDir(), "cloudflared.log");
 
 /**
- * Poll cloudflared log file for trycloudflare URL.
- * Stderr is redirected to this file (not piped) so cloudflared survives
- * parent supervisor exit during self-replace (no SIGPIPE on closed pipe).
+ * Wait for the quick-mode trycloudflare URL in the (offset-anchored) log —
+ * thin wrapper over phase 2a's `waitForLogLine` so quick mode keeps its own
+ * name/shape while sharing the stale-log-safe implementation with named mode.
  */
-async function extractUrlFromLogFile(getExitCode: () => number | null): Promise<string> {
-  const path = cloudflaredLogPath();
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    if (existsSync(path)) {
-      try {
-        const content = readFileSync(path, "utf8");
-        const match = content.match(TUNNEL_URL_REGEX);
-        if (match) return match[0];
-      } catch {}
-    }
-    if (getExitCode() !== null) throw new Error("cloudflared exited without providing URL");
-    await Bun.sleep(200);
-  }
-  throw new Error("Tunnel URL timeout (30s)");
+async function extractUrlFromLogFile(offset: number, getExitCode: () => number | null): Promise<string> {
+  return waitForLogLine(cloudflaredLogPath(), TUNNEL_URL_REGEX, {
+    fromByteOffset: offset,
+    timeoutMs: 30_000,
+    getExitCode,
+  });
 }
 
 async function syncUrlToCloud(url: string) {
@@ -620,26 +640,109 @@ async function syncUrlToCloud(url: string) {
 
 // HTTP heartbeat removed — WS is the sole heartbeat mechanism (Phase 4)
 
+/**
+ * Shared backoff-and-retry after a spawn attempt (or attempt sequence, named
+ * then quick fallback) produced no usable URL. Reuses the same crash budget
+ * quick-only mode always used — a persistent failure still retries forever,
+ * just slower — so named mode's extra fallback attempt never changes the
+ * retry cadence quick-only installs already depend on.
+ */
+async function retryTunnelAfterFailure(generation: number): Promise<void> {
+  if (shuttingDown) return;
+  const now = Date.now();
+  if (now - lastTunnelCrash > STABLE_WINDOW_MS) tunnelRestarts = 0;
+  lastTunnelCrash = now;
+  tunnelRestarts++;
+  if (tunnelRestarts > MAX_RESTARTS) tunnelRestarts = MAX_RESTARTS;
+  const delay = backoffDelay(tunnelRestarts) + Math.floor(Math.random() * 1000);
+  log("WARN", `Tunnel failed, retry in ${delay}ms (#${tunnelRestarts})`);
+  await Bun.sleep(delay);
+  if (generation !== tunnelGeneration) return; // superseded during backoff
+  // Re-read the live server port: spawnServer may have moved it since this
+  // attempt started, and a retry at the stale port would split-brain the tunnel.
+  return spawnTunnel(_opts.port, generation);
+}
+
+/** One spawn attempt's shape — named (identity from config) or quick (identity from log regex). */
+export interface TunnelAttempt {
+  mode: TunnelMode;
+  args: string[];
+  regex: RegExp;
+  urlFrom: "hostname" | "regex";
+}
+
+/**
+ * Build the ordered attempt list for this spawn: named first (if configured),
+ * falling back to quick — or quick-only when no named config exists. Quick's
+ * argv/regex are identical whichever position it takes.
+ *
+ * Exported so a unit test can assert argv parity with `getQuickTunnelArgs`
+ * against `spawnTunnel`'s actual call site, without spawning a real process.
+ */
+export function buildTunnelAttempts(config: ResolvedTunnelConfig, port: number): TunnelAttempt[] {
+  const plan = chooseTunnelSpawn(config, port);
+  if (plan.mode === "quick") {
+    return [{ mode: "quick", args: plan.args, regex: TUNNEL_URL_REGEX, urlFrom: "regex" }];
+  }
+  return [
+    { mode: "named", args: plan.args, regex: NAMED_TUNNEL_READY_REGEX, urlFrom: "hostname" },
+    { mode: "quick", args: getQuickTunnelArgs(port), regex: TUNNEL_URL_REGEX, urlFrom: "regex" },
+  ];
+}
+
+/**
+ * Decide the `tunnelWarning` field (if any) for a spawnTunnel success write.
+ *
+ * - `downgraded` (named was attempted first but failed, quick succeeded as
+ *   THIS spawn's fallback) is the only case a spawn ever WRITES a warning —
+ *   that text must persist until the user acts, so it is the sole owner here.
+ * - A quick success that was NOT a downgrade means the persisted config
+ *   itself resolved to quick outright (`attempts` was quick-only) — whether
+ *   that spawn was triggered by a deliberate retunnel-to-quick, a cold boot,
+ *   or any later regen while quick stays configured, it reconfirms the user
+ *   is no longer on named mode, so any warning left over from before they
+ *   switched (e.g. a stale "hostname unreachable") no longer applies.
+ * - A plain named success (not a downgrade) never touches the warning —
+ *   clearing a NAMED-mode warning is exclusively the probe's job once it
+ *   confirms the hostname is actually reachable (`named-tunnel-probe-state.ts`).
+ */
+export function tunnelWarningPatchForSpawnSuccess(
+  successfulMode: TunnelMode,
+  downgraded: boolean,
+): { tunnelWarning: string | null } | Record<string, never> {
+  if (downgraded) {
+    return { tunnelWarning: "Named tunnel failed to start — using a temporary quick URL" };
+  }
+  if (successfulMode === "quick") {
+    return { tunnelWarning: null };
+  }
+  return {};
+}
+
 export async function spawnTunnel(port: number, generation: number = ++tunnelGeneration): Promise<void> {
   tunnelPort = port; // remember origin port so resume/port-move can re-point
+  // Refresh the cached config here (not just at startup) — a fresh named
+  // setup, disable, or token rotation since the last spawn must be picked up
+  // before deciding what to spawn next.
+  namedTunnelMode = await readTunnelConfigFresh();
+
   let bin: string;
-  let quickArgs: string[];
   try {
-    const { ensureCloudflared, getQuickTunnelArgs } = await import("./cloudflared.service.ts");
+    const { ensureCloudflared } = await import("./cloudflared.service.ts");
     bin = await ensureCloudflared();
-    quickArgs = getQuickTunnelArgs(port);
   } catch (err) {
     log("ERROR", `Failed to get cloudflared: ${err}`);
     return;
   }
 
-  // Redirect cloudflared stderr to a log file (not pipe). This way cloudflared
-  // survives parent supervisor exit during self-replace — a piped stderr would
-  // close when parent exits, causing SIGPIPE on next cloudflared log write and
-  // killing the tunnel ~10-15s later (silently breaking adoption).
+  const attempts = buildTunnelAttempts(namedTunnelMode, port);
   const logPath = cloudflaredLogPath();
-  try { unlinkSync(logPath); } catch {}  // truncate stale URLs from prior run
-  const tunnelLogFd = openSync(logPath, "a");
+  // Truncate stale content from a prior generation; best-effort — Windows can
+  // silently fail this while a previous detached cloudflared still holds the
+  // file open, which is exactly why every readiness read below is anchored to
+  // a byte offset captured AFTER this attempt rather than trusting the file
+  // to actually be empty.
+  try { unlinkSync(logPath); } catch {}
 
   // ── Windows: spawn detached + windowless via node:child_process ────────
   // Bun.spawn ties children to the supervisor's job object, so the tunnel
@@ -652,109 +755,140 @@ export async function spawnTunnel(port: number, generation: number = ++tunnelGen
   // when the supervisor itself was started consoleless by the upgrade path.
   if (process.platform === "win32") {
     const { spawn: nodeSpawn } = require("node:child_process") as typeof import("node:child_process");
-    // Gated: fd stdio enables handle inheritance — spawning while a port
-    // probe is open would hand cloudflared the listener handle (see gate).
-    const proc = await withProbeSpawnGate(() => nodeSpawn(bin, quickArgs, {
-      detached: true,
-      windowsHide: true,
-      stdio: ["ignore", "ignore", tunnelLogFd] as ["ignore", "ignore", number],
-    }));
-    proc.unref();
-    try { closeSync(tunnelLogFd); } catch {}  // child keeps its own fd
-    const pid = proc.pid ?? null;
 
-    try {
-      tunnelUrl = await extractUrlFromLogFile(() => proc.exitCode);
-    } catch (err) {
-      log("ERROR", `Tunnel URL extraction failed: ${err}`);
-      tunnelUrl = null;
-      try { if (pid) process.kill(pid, "SIGKILL"); } catch {}
-      if (shuttingDown) return;
-      const now = Date.now();
-      if (now - lastTunnelCrash > STABLE_WINDOW_MS) tunnelRestarts = 0;
-      lastTunnelCrash = now;
-      tunnelRestarts++;
-      if (tunnelRestarts > MAX_RESTARTS) tunnelRestarts = MAX_RESTARTS;
-      const delay = backoffDelay(tunnelRestarts) + Math.floor(Math.random() * 1000);
-      log("WARN", `Tunnel failed, retry in ${delay}ms (#${tunnelRestarts})`);
-      await Bun.sleep(delay);
-      if (generation !== tunnelGeneration) return; // superseded during backoff
-      // Re-read the live server port: spawnServer may have moved it since this
-      // attempt started, and a retry at the stale port would split-brain the tunnel.
-      return spawnTunnel(_opts.port, generation);
+    let winPid: number | null = null;
+    let successfulMode: TunnelMode | null = null;
+    let resolvedUrl: string | null = null;
+    let downgraded = false;
+
+    for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i]!;
+      const offset = existsSync(logPath) ? statSync(logPath).size : 0;
+      const attemptLogFd = openSync(logPath, "a");
+      // Gated: fd stdio enables handle inheritance — spawning while a port
+      // probe is open would hand cloudflared the listener handle (see gate).
+      const proc = await withProbeSpawnGate(() => nodeSpawn(bin, attempt.args, {
+        detached: true,
+        windowsHide: true,
+        stdio: ["ignore", "ignore", attemptLogFd] as ["ignore", "ignore", number],
+      }));
+      proc.unref();
+      try { closeSync(attemptLogFd); } catch {} // child keeps its own fd
+      const pid = proc.pid ?? null;
+
+      try {
+        const matched = attempt.urlFrom === "hostname"
+          ? await waitForLogLine(logPath, attempt.regex, {
+              fromByteOffset: offset, timeoutMs: 30_000, getExitCode: () => proc.exitCode,
+            }).then(() => `https://${namedTunnelMode!.hostname}`)
+          : await extractUrlFromLogFile(offset, () => proc.exitCode);
+        tunnelUrl = matched;
+        resolvedUrl = matched;
+        winPid = pid;
+        successfulMode = attempt.mode;
+        downgraded = i > 0;
+        break;
+      } catch (err) {
+        log("ERROR", `${attempt.mode} tunnel failed to start: ${err}`);
+        try { if (pid) process.kill(pid, "SIGKILL"); } catch {}
+        tunnelUrl = null;
+        if (generation !== tunnelGeneration) return; // superseded — don't bother with the next attempt
+      }
+    }
+
+    if (winPid === null || !successfulMode || resolvedUrl === null) {
+      return retryTunnelAfterFailure(generation);
     }
 
     // A newer authoritative (re)start superseded us while we extracted the URL —
     // don't register as the live tunnel; kill our now-orphan child and bail.
     if (generation !== tunnelGeneration) {
-      try { if (pid) process.kill(pid, "SIGKILL"); } catch {}
+      try { process.kill(winPid, "SIGKILL"); } catch {}
       return;
     }
 
     // The detached tunnel is independent of this supervisor, so there is no
     // `.exited` promise to await for crash detection. Model it as adopted from
     // the start: the tunnel probe (startTunnelProbe) owns liveness + respawn.
-    adoptedTunnelPid = pid;
+    adoptedTunnelPid = winPid;
     tunnelChild = null;
-    updateStatus({ shareUrl: tunnelUrl, tunnelPid: pid, tunnelPort: port });
-    log("INFO", `Tunnel ready: ${tunnelUrl} (PID: ${pid}, detached)`);
-    await syncUrlToCloud(tunnelUrl);
+    lastSpawnMode = successfulMode;
+    // `namedProbeRestartAttempted` is deliberately NOT touched here — see the
+    // probe's `decideNamedProbeAction` state machine. A successful spawn only
+    // proves cloudflared reconnected to Cloudflare's edge, not that the
+    // configured hostname actually routes to it (that's a DNS/CNAME concern
+    // the probe alone can verify), so a bare respawn success must not re-arm
+    // the one-restart budget or the CNAME-deleted case would restart forever.
+    updateStatus({
+      shareUrl: resolvedUrl, tunnelPid: winPid, tunnelPort: port,
+      tunnelMode: successfulMode,
+      ...tunnelWarningPatchForSpawnSuccess(successfulMode, downgraded),
+    });
+    log("INFO", `Tunnel ready: ${resolvedUrl} (PID: ${winPid}, detached${downgraded ? ", downgraded from named" : ""})`);
+    await syncUrlToCloud(resolvedUrl);
     return;
   }
 
+  // ── POSIX ────────────────────────────────────────────────────────────────
   // Under systemd, wrap tunnel in a transient user scope so it lives in its
   // own cgroup instead of ppm.service. This prevents systemd from SIGKILLing
   // the tunnel when ppm.service cgroup is torn down during upgrade/restart,
-  // preserving the cloudflared trycloudflare URL across the new supervisor.
+  // preserving the tunnel URL across the new supervisor.
   // INVOCATION_ID is set by systemd; absence means we're not under systemd.
   const underSystemd = !!process.env.INVOCATION_ID && process.platform === "linux";
-  const tunnelCmd = underSystemd
-    ? [
-        "systemd-run", "--user", "--scope", "--quiet", "--collect",
-        "--",
-        bin, ...quickArgs,
-      ]
-    : [bin, ...quickArgs];
+  const buildCmd = (args: string[]): string[] =>
+    underSystemd
+      ? ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", bin, ...args]
+      : [bin, ...args];
 
-  // Own this cloudflared via a LOCAL ref for the whole loop. `tunnelChild` is a
-  // mutable global that a concurrent restartTunnel() nulls/reassigns; awaiting
-  // `tunnelChild.exited` on it would throw `TypeError: null is not an object`
-  // mid-flight, killing this loop WITHOUT reaping the child we spawned →
-  // orphaned cloudflared (PID 1). The local ref keeps our lifecycle
-  // self-contained; we only touch the global when it still points at us.
-  let child: Subprocess;
-  try {
-    child = await withProbeSpawnGate(() =>
-      Bun.spawn(tunnelCmd, { stderr: tunnelLogFd, stdout: "ignore", stdin: "ignore" }));
-    tunnelChild = child; // publish so restartTunnel/killStaleTunnel can reach the live child
-  } finally {
-    // Close our handle; cloudflared keeps its own via dup2
-    try { closeSync(tunnelLogFd); } catch {}
+  let child: Subprocess | null = null;
+  let successfulMode: TunnelMode | null = null;
+  let resolvedUrl: string | null = null;
+  let downgraded = false;
+
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i]!;
+    const offset = existsSync(logPath) ? statSync(logPath).size : 0;
+    const attemptLogFd = openSync(logPath, "a");
+    // Own this cloudflared via a LOCAL ref for the whole loop. `tunnelChild` is
+    // a mutable global that a concurrent restartTunnel() nulls/reassigns;
+    // awaiting `tunnelChild.exited` on it would throw mid-flight, killing this
+    // loop WITHOUT reaping the child we spawned — orphaned cloudflared. The
+    // local ref keeps lifecycle self-contained; only touch the global when it
+    // still points at us.
+    let attemptChild: Subprocess;
+    try {
+      attemptChild = await withProbeSpawnGate(() =>
+        Bun.spawn(buildCmd(attempt.args), { stderr: attemptLogFd, stdout: "ignore", stdin: "ignore" }));
+      tunnelChild = attemptChild; // publish so restartTunnel/killStaleTunnel can reach the live child
+    } finally {
+      try { closeSync(attemptLogFd); } catch {} // cloudflared keeps its own via dup2
+    }
+    if (underSystemd && i === 0) log("INFO", "Tunnel spawned inside transient systemd-run scope (escapes ppm.service cgroup)");
+
+    try {
+      const matched = attempt.urlFrom === "hostname"
+        ? await waitForLogLine(logPath, attempt.regex, {
+            fromByteOffset: offset, timeoutMs: 30_000, getExitCode: () => attemptChild.exitCode,
+          }).then(() => `https://${namedTunnelMode!.hostname}`)
+        : await extractUrlFromLogFile(offset, () => attemptChild.exitCode);
+      tunnelUrl = matched;
+      resolvedUrl = matched;
+      child = attemptChild;
+      successfulMode = attempt.mode;
+      downgraded = i > 0;
+      break;
+    } catch (err) {
+      log("ERROR", `${attempt.mode} tunnel failed to start: ${err}`);
+      try { attemptChild.kill(); } catch {}
+      if (tunnelChild === attemptChild) tunnelChild = null;
+      tunnelUrl = null;
+      if (generation !== tunnelGeneration) return; // superseded — don't bother with the next attempt
+    }
   }
-  if (underSystemd) log("INFO", "Tunnel spawned inside transient systemd-run scope (escapes ppm.service cgroup)");
 
-  try {
-    tunnelUrl = await extractUrlFromLogFile(() => child.exitCode);
-  } catch (err) {
-    log("ERROR", `Tunnel URL extraction failed: ${err}`);
-    tunnelUrl = null;
-    try { child.kill(); } catch {}
-    if (tunnelChild === child) tunnelChild = null;
-
-    if (shuttingDown) return;
-
-    const now = Date.now();
-    if (now - lastTunnelCrash > STABLE_WINDOW_MS) tunnelRestarts = 0;
-    lastTunnelCrash = now;
-    tunnelRestarts++;
-
-    // Never give up: cap the counter so backoff plateaus at BACKOFF_MAX_MS (no 10-min dark window).
-    if (tunnelRestarts > MAX_RESTARTS) tunnelRestarts = MAX_RESTARTS;
-    const delay = backoffDelay(tunnelRestarts) + Math.floor(Math.random() * 1000);
-    log("WARN", `Tunnel failed, retry in ${delay}ms (#${tunnelRestarts})`);
-    await Bun.sleep(delay);
-    if (generation !== tunnelGeneration) return; // superseded during backoff
-    return spawnTunnel(_opts.port, generation); // live port — may have moved since this attempt
+  if (!child || !successfulMode || resolvedUrl === null) {
+    return retryTunnelAfterFailure(generation);
   }
 
   // A newer authoritative (re)start superseded us while we extracted the URL —
@@ -765,11 +899,19 @@ export async function spawnTunnel(port: number, generation: number = ++tunnelGen
     return;
   }
 
-  updateStatus({ shareUrl: tunnelUrl, tunnelPid: child.pid, tunnelPort: port });
-  log("INFO", `Tunnel ready: ${tunnelUrl} (PID: ${child.pid})`);
+  lastSpawnMode = successfulMode;
+  // `namedProbeRestartAttempted` is deliberately NOT touched here — see the
+  // probe's `decideNamedProbeAction` state machine and the win32 branch above
+  // for why a bare spawn success must never re-arm the one-restart budget.
+  updateStatus({
+    shareUrl: resolvedUrl, tunnelPid: child.pid, tunnelPort: port,
+    tunnelMode: successfulMode,
+    ...tunnelWarningPatchForSpawnSuccess(successfulMode, downgraded),
+  });
+  log("INFO", `Tunnel ready: ${resolvedUrl} (PID: ${child.pid}${downgraded ? ", downgraded from named" : ""})`);
 
   // One-time sync of tunnel URL to cloud (WS handles periodic heartbeat)
-  await syncUrlToCloud(tunnelUrl);
+  await syncUrlToCloud(resolvedUrl);
 
   const exitCode = await child.exited;
   if (tunnelChild === child) tunnelChild = null;
@@ -786,22 +928,8 @@ export async function spawnTunnel(port: number, generation: number = ++tunnelGen
     return;
   }
 
-  // Crash — apply backoff
-  const now = Date.now();
-  if (now - lastTunnelCrash > STABLE_WINDOW_MS) tunnelRestarts = 0;
-  lastTunnelCrash = now;
-  tunnelRestarts++;
-
-  // Never give up: cap the counter so backoff plateaus at BACKOFF_MAX_MS (no 10-min dark window).
-  if (tunnelRestarts > MAX_RESTARTS) tunnelRestarts = MAX_RESTARTS;
-  const delay = backoffDelay(tunnelRestarts) + Math.floor(Math.random() * 1000);
-  log("WARN", `Tunnel process exited (code=${exitCode}, url=${deadUrl}), restart in ${delay}ms (#${tunnelRestarts})`);
-  await Bun.sleep(delay);
-
-  if (generation !== tunnelGeneration) return; // superseded during backoff
-  // Respawn at the server's live port, not this spawn's original target —
-  // the server may have moved (zombie-port fallback) while the tunnel was up.
-  if (!shuttingDown) return spawnTunnel(_opts.port, generation);
+  log("WARN", `Tunnel process exited (code=${exitCode}, url=${deadUrl}), applying backoff`);
+  return retryTunnelAfterFailure(generation);
 }
 
 // ─── Health checks ─────────────────────────────────────────────────────
@@ -863,6 +991,44 @@ function startServerHealthCheck() {
   }, SERVER_HEALTH_INTERVAL_MS);
 }
 
+/**
+ * Named-mode identity probe: fetch the public hostname's health and our own
+ * loopback health, then compare `instanceId`. A mismatch means someone else's
+ * connector is answering our hostname (treat as unreachable, same as a fetch
+ * failure); this is what lets a dead-but-adopted named connector be told apart
+ * from a live one that Cloudflare has quietly repointed. Falls back to a bare
+ * reachability check when either side omits `instanceId` (older server build,
+ * or the loopback port isn't resolvable yet) rather than hard-failing.
+ */
+async function probeNamedTunnelHealth(): Promise<boolean> {
+  try {
+    // `Connection: close` is load-bearing: this probe runs every 30s for the
+    // life of the supervisor, and a pooled keep-alive socket pins us to
+    // whatever IP the hostname resolved to when the pool opened it. Observed
+    // live: after a deleted CNAME fell back to the zone's wildcard host, the
+    // pooled socket kept answering from that host for minutes after the CNAME
+    // was restored — the probe never saw the recovery. A fresh connection per
+    // probe follows DNS.
+    const publicRes = await fetch(`${tunnelUrl}/api/health`, {
+      signal: AbortSignal.timeout(10_000),
+      headers: { connection: "close" },
+    });
+    if (!publicRes.ok) return false;
+    _resetTargetCache();
+    const checkPort = resolveTargetPort();
+    if (checkPort === null) return true; // can't compare identity yet — reachability alone is enough for now
+    const publicBody = await publicRes.json().catch(() => null) as { data?: { instanceId?: unknown } } | null;
+    const localRes = await fetch(`http://127.0.0.1:${checkPort}/api/health`, { signal: AbortSignal.timeout(5000) });
+    if (!localRes.ok) return true; // our own server's health is startServerHealthCheck's job, not this probe's
+    const localBody = await localRes.json().catch(() => null) as { data?: { instanceId?: unknown } } | null;
+    // A 200 alone proves nothing: a deleted CNAME falls back to the zone's
+    // wildcard record and an unrelated host answers. Identity decides.
+    return publicHostnameIsOurs(publicBody?.data?.instanceId, localBody?.data?.instanceId);
+  } catch {
+    return false;
+  }
+}
+
 function startTunnelProbe() {
   tunnelProbeTimer = setInterval(async () => {
     if (shuttingDown || !tunnelUrl) { tunnelFailCount = 0; return; }
@@ -876,7 +1042,8 @@ function startTunnelProbe() {
         log("WARN", "Adopted tunnel process died, respawning");
         adoptedTunnelPid = null;
         tunnelUrl = null;
-        updateStatus({ shareUrl: null, tunnelPid: null });
+        // Named URL is pinned — don't flicker it null for the brief respawn window.
+        updateStatus(lastSpawnMode === "named" ? { tunnelPid: null } : { shareUrl: null, tunnelPid: null });
         tunnelFailCount = 0;
         spawnTunnel(_opts.port); // live server port, not the startup config port
         return;
@@ -889,31 +1056,73 @@ function startTunnelProbe() {
     // on every probe window while the real problem is the server.
     if (getState() !== "running" || !serverChild) { tunnelFailCount = 0; return; }
 
-    try {
-      const res = await fetch(`${tunnelUrl}/api/health`, {
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (res.ok) {
-        tunnelFailCount = 0;
-        tunnelRestarts = 0;
-        return;
+    if (lastSpawnMode === "named") {
+      const healthy = await probeNamedTunnelHealth();
+      // All state transitions for the restart-once-then-warn budget live in
+      // this pure helper — the ONLY place `restartAttempted` (and the
+      // warning) is ever cleared is a confirmed-healthy observation here,
+      // never a bare spawn success (see spawnTunnel's success writes).
+      const { action, nextState } = decideNamedProbeAction(
+        healthy,
+        { failCount: tunnelFailCount, restartAttempted: namedProbeRestartAttempted },
+        TUNNEL_ZOMBIE_THRESHOLD,
+      );
+      tunnelFailCount = nextState.failCount;
+      namedProbeRestartAttempted = nextState.restartAttempted;
+
+      switch (action.type) {
+        case "healthy":
+          tunnelRestarts = 0;
+          // Only write when there's actually a warning to clear — otherwise
+          // this fires every healthy 30s tick forever (tmp-write + rename on
+          // every single cycle) even though nothing ever changes.
+          if (readStatus().tunnelWarning != null) updateStatus({ tunnelWarning: null });
+          return;
+        case "watch":
+          return;
+        case "restart-once":
+          log("WARN", "Named tunnel unreachable at threshold — restarting the connector once");
+          if (tunnelChild) {
+            try { tunnelChild.kill(); } catch {}
+            // spawnTunnel loop handles respawn via exited promise
+          } else if (adoptedTunnelPid) {
+            try { process.kill(adoptedTunnelPid, "SIGTERM"); } catch {}
+            adoptedTunnelPid = null;
+            spawnTunnel(_opts.port); // live server port, not the startup config port
+          }
+          return;
+        case "warn-and-stop":
+          // Already tried a restart — the hostname is still dark. Never loop
+          // further and never null the pinned URL; just surface the warning.
+          log("WARN", "Named tunnel still unreachable after one restart — warning and stopping (shareUrl stays pinned)");
+          updateStatus({ tunnelWarning: "hostname unreachable — check DNS/Cloudflare" });
+          return;
       }
-    } catch {}
-    tunnelFailCount++;
-    if (tunnelFailCount >= TUNNEL_ZOMBIE_THRESHOLD) {
-      log("WARN", `Tunnel URL zombie (${tunnelFailCount} fails ≈ ${tunnelFailCount * (TUNNEL_PROBE_INTERVAL_MS / 1000)}s, process alive but edge dropped), regenerating`);
-      if (tunnelChild) {
-        try { tunnelChild.kill(); } catch {}
-        // spawnTunnel loop handles respawn via exited promise
-      } else if (adoptedTunnelPid) {
-        try { process.kill(adoptedTunnelPid, "SIGTERM"); } catch {}
-        adoptedTunnelPid = null;
-        tunnelUrl = null;
-        updateStatus({ shareUrl: null, tunnelPid: null });
-        spawnTunnel(_opts.port); // live server port, not the startup config port
-      }
-      tunnelFailCount = 0;
+      return;
     }
+
+    // Quick mode: existing zombie-regen behavior, unchanged.
+    const healthy = await fetch(`${tunnelUrl}/api/health`, { signal: AbortSignal.timeout(10_000) })
+      .then((res) => res.ok).catch(() => false);
+    if (healthy) {
+      tunnelFailCount = 0;
+      tunnelRestarts = 0;
+      return;
+    }
+    tunnelFailCount++;
+    if (tunnelFailCount < TUNNEL_ZOMBIE_THRESHOLD) return;
+    log("WARN", `Tunnel URL zombie (${tunnelFailCount} fails ≈ ${tunnelFailCount * (TUNNEL_PROBE_INTERVAL_MS / 1000)}s, process alive but edge dropped), regenerating`);
+    if (tunnelChild) {
+      try { tunnelChild.kill(); } catch {}
+      // spawnTunnel loop handles respawn via exited promise
+    } else if (adoptedTunnelPid) {
+      try { process.kill(adoptedTunnelPid, "SIGTERM"); } catch {}
+      adoptedTunnelPid = null;
+      tunnelUrl = null;
+      updateStatus({ shareUrl: null, tunnelPid: null });
+      spawnTunnel(_opts.port); // live server port, not the startup config port
+    }
+    tunnelFailCount = 0;
   }, TUNNEL_PROBE_INTERVAL_MS);
 }
 
@@ -944,12 +1153,30 @@ function adoptTunnel(): boolean {
       return false;
     }
     process.kill(pid, 0); // throws if process is dead
+    // Liveness alone is not proof of identity — Windows/Linux both reuse PIDs,
+    // and a recycled PID happening to belong to some unrelated process would
+    // get "adopted" as the tunnel while the real one (if any) sits orphaned.
+    if (!isCloudflaredPid(pid)) {
+      log("WARN", `adoptTunnel: PID ${pid} is alive but its executable is not cloudflared — refusing to adopt`);
+      return false;
+    }
+    // Named mode's URL is pinned to the configured hostname. A stale quick URL
+    // left over from before named was configured (or from a downgrade) must
+    // never be adopted as if it were the named tunnel.
+    if (namedTunnelMode?.mode === "named") {
+      const expected = `https://${namedTunnelMode.hostname}`;
+      if (url !== expected) {
+        log("WARN", `adoptTunnel: status.shareUrl ${url} does not match configured named hostname ${expected} — refusing to adopt`);
+        return false;
+      }
+    }
     adoptedTunnelPid = pid;
     tunnelUrl = url;
     // Remember which origin port the adopted tunnel targets so spawnServer can
     // bind THERE (not the configured port) and keep the public URL alive.
     if (typeof status.tunnelPort === "number") tunnelPort = status.tunnelPort;
-    log("INFO", `Adopted existing tunnel (PID: ${pid}, URL: ${url}, origin port: ${tunnelPort ?? "unknown"})`);
+    if (typeof status.tunnelMode === "string") lastSpawnMode = status.tunnelMode as TunnelMode;
+    log("INFO", `Adopted existing tunnel (PID: ${pid}, URL: ${url}, origin port: ${tunnelPort ?? "unknown"}, mode: ${lastSpawnMode})`);
     return true;
   } catch (e) {
     log("WARN", `adoptTunnel: tunnel PID ${(readStatus().tunnelPid)} unreachable: ${e}`);
@@ -969,6 +1196,18 @@ function killStaleTunnel() {
   updateStatus({ tunnelPid: null, shareUrl: null });
 }
 
+/**
+ * `pgrep -f` pattern matching PPM's own cloudflared, running EITHER mode's
+ * long-lived connector. `.*` spans the `--config <path>`/`--origincert` args
+ * between bin and `tunnel`. Deliberately does NOT match `tunnel
+ * login`/`create`/`route`/`token` — those are short-lived management
+ * subcommands the reaper must never SIGTERM mid-flight. Exported so a unit
+ * test can assert the match/exclude set without shelling out to pgrep.
+ */
+export function orphanedTunnelPgrepPattern(bin: string): string {
+  return `${bin}.*tunnel (run|--url)`;
+}
+
 /** Reap orphaned cloudflared processes left by crashed supervisors or stale
  *  spawn loops. Matches PPM's own cloudflared bin path and SIGTERMs every match
  *  except `keepPid`. POSIX only — on win32 the tunnel is tied to the job object
@@ -980,8 +1219,7 @@ async function reapOrphanedTunnels(keepPid: number | null): Promise<void> {
   try {
     const { getCloudflaredPath } = await import("./cloudflared.service.ts");
     const bin = getCloudflaredPath();
-    // `.*` spans the `--config <path>` args that sit between bin and `tunnel`.
-    const res = Bun.spawnSync(["pgrep", "-f", `${bin}.*tunnel --url`]);
+    const res = Bun.spawnSync(["pgrep", "-f", orphanedTunnelPgrepPattern(bin)]);
     // pgrep exits 1 when nothing matches — not an error.
     const pids = new TextDecoder().decode(res.stdout)
       .split("\n")
@@ -1546,6 +1784,15 @@ export async function runSupervisor(opts: {
     // so its PID must survive this wholesale rewrite or the new supervisor
     // would spawn a second edge and collide on the public port.
     edgePid: isUpgrade ? (prevStatus.edgePid ?? null) : null,
+    // tunnelMode/tunnelWarning survive an upgrade the same way tunnelPid/shareUrl
+    // do above — otherwise a live named tunnel would report as unset mode with
+    // no warning history the instant the new supervisor takes over.
+    tunnelMode: isUpgrade ? (prevStatus.tunnelMode ?? null) : null,
+    tunnelWarning: isUpgrade ? (prevStatus.tunnelWarning ?? null) : null,
+    // Unconditional (not upgrade-gated): every boot of this code understands
+    // "retunnel" — its ABSENCE is how phase 3's UI detects a pre-upgrade
+    // supervisor that predates the retunnel command entirely.
+    capabilities: ["retunnel"],
     serverPort: null, // republished by the server on every spawn
   });
   // Diagnostic: a cold start (isUpgrade=false) always nulls the tunnel and forces
@@ -1583,8 +1830,8 @@ export async function runSupervisor(opts: {
   process.on("SIGINT", () => forceShutdown("SIGINT"));
 
   // SIGUSR2 = command file dispatch OR graceful server restart
-  process.on("SIGUSR2", () => {
-    // Check for command file first (soft_stop, resume)
+  process.on("SIGUSR2", async () => {
+    // Check for command file first (soft_stop, resume, retunnel)
     const cmd = readAndDeleteCmd();
     if (cmd) {
       if (cmd.action === "soft_stop") {
@@ -1599,9 +1846,26 @@ export async function runSupervisor(opts: {
         }
         return;
       }
+      if (cmd.action === "retunnel") {
+        log("INFO", "SIGUSR2: retunnel command received");
+        namedTunnelMode = await readTunnelConfigFresh();
+        // A deliberate corrective action (e.g. the user just fixed DNS) gets a
+        // fresh one-restart budget rather than inheriting a stale exhausted one —
+        // both the flag and the fail counter, or a nearly-full counter carried
+        // over from the outage trips "restart once" after a handful of probes.
+        namedProbeRestartAttempted = false;
+        tunnelFailCount = 0;
+        restartTunnel(_opts.port);
+        // Deliberate fall-through (no return): a bare `ppm restart` sends a
+        // bare SIGUSR2 with no command file of its own, and a `retunnel` that
+        // happens to still be unclaimed at that instant must not silently
+        // swallow the user's restart intent. Retunneling first costs nothing
+        // extra — it's a fast no-op when the tunnel is already correct — and
+        // this still restarts the server exactly like a plain SIGUSR2 would.
+      }
     }
 
-    // Default: restart server (existing behavior)
+    // Default: restart server (existing behavior, and retunnel's fall-through target)
     if (getState() === "paused") {
       log("INFO", "SIGUSR2 received while paused, resuming server");
       triggerResume();
@@ -1715,6 +1979,21 @@ export async function runSupervisor(opts: {
           requestServerShutdown(serverChild).catch(() => {});
         }
       }
+      else if (cmd.action === "retunnel") {
+        log("INFO", "Windows command: retunnel");
+        // No POSIX-style fall-through ambiguity here — every command on this
+        // poll loop is an explicit file, one command per tick, already claimed
+        // atomically by readAndDeleteCmd. Just retunnel; don't also trigger
+        // the unrelated "restart" branch.
+        readTunnelConfigFresh().then((cfg) => {
+          namedTunnelMode = cfg;
+          // A deliberate corrective action gets a fresh one-restart budget
+          // rather than inheriting a stale exhausted one (flag AND counter).
+          namedProbeRestartAttempted = false;
+          tunnelFailCount = 0;
+          restartTunnel(_opts.port);
+        });
+      }
       else if (cmd.action === "upgrade") {
         log("INFO", "Windows command: upgrade, starting self-replace");
         selfReplace().then((result) => {
@@ -1742,6 +2021,14 @@ export async function runSupervisor(opts: {
   // settled first — the old order raced spawnServer's port selection.
   let tunnelAdopted = false;
   if (opts.share) {
+    // Populate the cache BEFORE adoptTunnel/probe — an adopted tunnel skips
+    // spawnTunnel entirely for this whole generation, so without this the
+    // cache would stay null (adoptTunnel's named-hostname gate always refuses,
+    // and the probe can never tell named from quick) until the next spawn.
+    namedTunnelMode = await readTunnelConfigFresh();
+    // Defensive — already `false` at module init, but a fresh boot must never
+    // start with an inherited restart-once budget "spent".
+    namedProbeRestartAttempted = false;
     startTunnelProbe();
     // Try adopting tunnel kept alive from previous upgrade; spawn new if dead
     tunnelAdopted = adoptTunnel();

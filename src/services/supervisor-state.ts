@@ -71,7 +71,10 @@ export function writeStatus(data: Record<string, unknown>) {
 }
 
 // ─── Command file protocol ─────────────────────────────────────────────
-export type CmdAction = "soft_stop" | "resume" | "restart";
+// "upgrade" is written directly by upgrade.service.ts (bypasses writeCmd, same
+// as restart.ts/stop.ts) and read by supervisor.ts's Windows poll loop — listed
+// here so the type matches what's actually read/written on disk.
+export type CmdAction = "soft_stop" | "resume" | "restart" | "retunnel" | "upgrade";
 
 /** Atomically claim + read command file (rename to .claimed, read, delete) */
 export function readAndDeleteCmd(): { action: CmdAction } | null {
@@ -88,8 +91,70 @@ export function readAndDeleteCmd(): { action: CmdAction } | null {
   }
 }
 
-export function writeCmd(action: CmdAction) {
+/**
+ * `retunnel` is the only low-priority action — it always yields to whatever
+ * is already pending, since a named-tunnel reload can wait behind a genuine
+ * lifecycle transition. The other three outrank it: a `resume` stuck behind
+ * an unclaimed `retunnel` would otherwise leave the server looking stopped
+ * (win32's poll loop is 1s; POSIX has a write/SIGUSR2 gap) for no reason.
+ */
+const LIFECYCLE_ACTIONS: readonly CmdAction[] = ["resume", "soft_stop", "restart", "upgrade"];
+
+/**
+ * Write `.supervisor-cmd`, but never clobber a *different* action that's still
+ * unclaimed — with one exception: a lifecycle action (`resume`/`soft_stop`/
+ * `restart`/`upgrade`) always overwrites a pending `retunnel`. Any other
+ * collision (two different lifecycle actions, or a `retunnel` behind a
+ * pending lifecycle action) returns `false` without writing so the caller can
+ * report "busy" instead of silently discarding someone else's request; a
+ * warning is logged either way so a dropped command is never silent. Note:
+ * `restart.ts`/`stop.ts` write this file directly and bypass this peek
+ * entirely, so the supervisor's dispatcher must still treat a stale/racing
+ * action defensively regardless of who wrote it — this is a best-effort
+ * single-slot guard, not a full queue.
+ */
+export function writeCmd(action: CmdAction): boolean {
+  try {
+    const existing = JSON.parse(readFileSync(CMD_FILE(), "utf-8")) as { action?: string };
+    if (existing?.action && existing.action !== action) {
+      const lifecycleOverridesRetunnel = LIFECYCLE_ACTIONS.includes(action) && existing.action === "retunnel";
+      if (!lifecycleOverridesRetunnel) {
+        try { process.stderr.write(`[writeCmd] dropped "${action}" — "${existing.action}" is already pending\n`); } catch {}
+        return false;
+      }
+    }
+  } catch {
+    // Missing file, unreadable, or invalid JSON — nothing unclaimed to protect.
+  }
   writeFileSync(CMD_FILE(), JSON.stringify({ action }));
+  return true;
+}
+
+/**
+ * Ask the running supervisor to reload the tunnel (e.g. after a named-tunnel
+ * setup/disable). POSIX confirms the supervisor is alive via a zero-signal
+ * probe before writing; win32 has no equivalent probe here, so it relies on
+ * the supervisor's existing 1s command-file poll loop to pick up the request.
+ */
+export function requestTunnelReload(): "sent" | "busy" | "no-supervisor" {
+  const status = readStatus();
+  const pid = status.supervisorPid as number | undefined;
+  if (!pid) return "no-supervisor";
+
+  if (process.platform !== "win32") {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return "no-supervisor";
+    }
+  }
+
+  if (!writeCmd("retunnel")) return "busy";
+
+  if (process.platform !== "win32") {
+    try { process.kill(pid, "SIGUSR2"); } catch { /* best-effort; poll loop is the fallback path */ }
+  }
+  return "sent";
 }
 
 // ─── Lockfile ──────────────────────────────────────────────────────────

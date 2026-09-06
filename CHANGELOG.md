@@ -1,16 +1,26 @@
 # Changelog
 
-## [Unreleased]
+## [0.18.13] - 2026-09-07
 
 ### Added
 - **Stable public URL on your own domain** — a named tunnel via Cloudflare login pins PPM to `https://<prefix>.<zone>`, no more rotating URL on restart or hibernate; quick tunnel stays the default and the fallback.
 - **Quick-tunnel fallback warning** — if a named tunnel fails to start, or its hostname stops resolving, PPM falls back to (or stays on) the quick tunnel and shows why.
+- **Temporary link alongside your domain** — the share card can add a throwaway trycloudflare link without touching the permanent one, for sharing once without handing out your hostname.
+- **Early notice when the domain stops answering** — a warning appears after about a minute instead of five, and the cloud heartbeat now reports the real state instead of always saying "online".
 
 ### Changed
 - **Named tunnel setup requires `auth.enabled`** — the popup stays hidden and every mutating tunnel endpoint 403s while PPM auth is off.
 - **`~/.cloudflared` is now refused by the file browser API**, the same protection the PPM config directory already had, covering read/copy/move/upload.
 - **`ppm stop`/`ppm down` on Windows only kill this PPM's own cloudflared** — the old image-wide `taskkill` also took down every other cloudflared on the machine (another PPM instance, your own tunnels), rotating their URLs.
 - **Tunnel and auth secrets are masked wherever config is echoed back** — `ppm config get`, the extension RPC, and `ppm status` never print a raw token, even when an ancestor object (`tunnel`, `auth`) is requested.
+
+### Fixed
+- **Share card showed a retired URL** — it kept the first link it ever saw, so it still offered a temporary URL minutes after a permanent one went live; the cloud heartbeat had the same stale value.
+- **The offline screen no longer tells you to hunt for a new link** when you arrive through your own domain — that address never changes; it now offers your local-network address instead.
+- **Auto-start status works on machines with no service manager** instead of failing outright.
+- **File watching on Linux** attaches per-directory handles rather than delegating subtrees, with a larger per-project budget.
+- **Notification "Clear all"** now reaches rows that were never created, so unread counts cannot get stuck.
+- **Chat toolbar controls stay reachable in a narrow chat pane.**
 
 ## [0.18.12] - 2026-09-05
 

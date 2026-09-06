@@ -343,6 +343,14 @@ component (`TabPool`).
   reconcile) routes through `redockFromWindow`, which re-docks to the origin panel if it is still in
   the grid, else the focused grid panel, else the first grid panel. All tab types pop out except
   `system-monitor`, which already has its own window kind.
+- **Straight to PiP.** The tab context menu offers a second route (`open-tab-in-pip.ts`): pop out,
+  then adopt the new window's body into a PiP window in the same gesture. The window is real — PiP
+  can only adopt an element already in the page, and it needs a home to restore into — but it is
+  marked pip-only (`markPipOnlyWindow`, `window-pip-registry.ts`), which makes the frame render it
+  `hidden` (never unmounted: the body must stay connected for the restore) and makes closing PiP
+  close the window, so the tab lands back in its strip. The one await between the two steps is a
+  React commit — the frame's layout effect publishes the body element (`whenWindowSlot`) — which
+  leaves the click's transient activation intact for `requestWindow()`.
 - **No-remount move.** `TabPool` (`components/layout/tab-pool.tsx`) mounts every tab once into a
   wrapper `div[data-tab-pool-id]` created imperatively in `ReparentingTab`
   (`components/layout/reparenting-tab.tsx`) and rendered into it via `createPortal` — React attaches

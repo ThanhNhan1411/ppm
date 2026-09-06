@@ -132,9 +132,10 @@ not by any one kind. Any future floating-window feature must follow the same con
   explains itself) on browsers without `documentPictureInPicture`. The "Bring back" control shown
   while a window plays in PiP is a full ≥44×44px touch target like any other primary action.
 - **Tab-host windows** (a tab detached from its panel, plus its optional PiP step) follow the same
-  desktop-only rule as every other kind: below `md`, "Open in window" is hidden from the tab
+  desktop-only rule as every other kind: below `md`, both detach items are hidden from the tab
   context menu and any already-detached tabs reconcile back into the grid — a windowed tab is
-  never shown scaled down.
+  never shown scaled down. "Open in picture-in-picture" is the one-step route: no window is ever
+  shown, and closing PiP returns the tab to its strip rather than leaving a window behind.
 
 ---
 

@@ -10,6 +10,10 @@ import { writeCmd, requestTunnelReload, CMD_FILE, STATUS_FILE } from "../../../s
 // keeps the test process alive so we can assert on the return value instead.
 process.on("SIGUSR2", () => {});
 
+// Restore, never delete: the bunfig preload's PPM_HOME shields later test
+// files in this process from the real ~/.ppm.
+const ORIGINAL_PPM_HOME = process.env.PPM_HOME;
+
 describe("supervisor-state — retunnel", () => {
   let ppmHome: string;
 
@@ -20,7 +24,8 @@ describe("supervisor-state — retunnel", () => {
   });
 
   afterEach(() => {
-    delete process.env.PPM_HOME;
+    if (ORIGINAL_PPM_HOME === undefined) delete process.env.PPM_HOME;
+    else process.env.PPM_HOME = ORIGINAL_PPM_HOME;
     _resetPpmDir();
     rmSync(ppmHome, { recursive: true, force: true });
   });

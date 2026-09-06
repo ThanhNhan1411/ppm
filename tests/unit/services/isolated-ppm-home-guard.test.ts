@@ -12,6 +12,8 @@ afterEach(() => {
 
 describe("isIsolatedPpmHome", () => {
   test("false when PPM_HOME is unset (normal production run)", () => {
+    // ppm-home-unset-is-the-subject: unset IS the case under test here; the
+    // afterEach above restores the preload value for every later test file.
     delete process.env.PPM_HOME;
     expect(isIsolatedPpmHome()).toBe(false);
   });

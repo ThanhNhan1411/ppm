@@ -10,11 +10,13 @@ import {
 } from "../../../../src/services/fs-ops/fs-ops-mutate.service.ts";
 import { copyPath, movePath } from "../../../../src/services/fs-ops/fs-ops-copy-move.service.ts";
 import { getPpmDir } from "../../../../src/services/ppm-dir.ts";
+import { assertIsolatedPpmHome } from "../../../helpers/assert-isolated-ppm-home.ts";
 
 let dir: string;
 
 /** Stand-in for the credentials store; PPM_HOME is an isolated temp dir here. */
 function ppmSecret(): string {
+  assertIsolatedPpmHome();
   const secret = join(getPpmDir(), "ppm.db");
   mkdirSync(getPpmDir(), { recursive: true });
   writeFileSync(secret, "secret");
@@ -31,6 +33,7 @@ const cloudflaredDirPreexisted = existsSync(cloudflaredDir);
 let cloudflaredMarker: string;
 
 beforeEach(() => {
+  assertIsolatedPpmHome();
   dir = mkdtempSync(join(tmpdir(), "fs-mutate-"));
 });
 afterEach(() => {

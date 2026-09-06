@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { trashPath, type TrashRunner } from "../../../../src/services/fs-ops/fs-ops-trash.service.ts";
 import { getPpmDir } from "../../../../src/services/ppm-dir.ts";
+import { assertIsolatedPpmHome } from "../../../helpers/assert-isolated-ppm-home.ts";
 
 let dir: string;
 
@@ -66,6 +67,7 @@ describe("trashPath", () => {
   });
 
   it("refuses a file inside the PPM directory", async () => {
+    assertIsolatedPpmHome();
     const secret = join(getPpmDir(), "ppm.db");
     mkdirSync(getPpmDir(), { recursive: true });
     writeFileSync(secret, "secret");

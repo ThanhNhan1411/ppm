@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { browse } from "../../../src/services/fs-browse.service.ts";
 import { getPpmDir } from "../../../src/services/ppm-dir.ts";
+import { assertIsolatedPpmHome } from "../../helpers/assert-isolated-ppm-home.ts";
 
 const isWin = process.platform === "win32";
 let dir: string;
@@ -69,6 +70,7 @@ describe("browse", () => {
   });
 
   it("still lists the PPM directory so the sidebar is not confused", async () => {
+    assertIsolatedPpmHome();
     writeFileSync(join(getPpmDir(), "ppm.db"), "secret");
     const result = await browse(getPpmDir());
     expect(result.entries.some((e) => e.name === "ppm.db")).toBe(true);

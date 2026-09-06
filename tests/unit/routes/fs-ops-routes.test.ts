@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fsOpsRoutes } from "../../../src/server/routes/fs-ops.ts";
 import { getPpmDir } from "../../../src/services/ppm-dir.ts";
+import { assertIsolatedPpmHome } from "../../helpers/assert-isolated-ppm-home.ts";
 
 const app = new Hono().route("/fs", fsOpsRoutes);
 let dir: string;
@@ -128,6 +129,7 @@ describe("DELETE /fs/delete", () => {
   it("refuses a file inside the PPM directory", async () => {
     // The credentials database, not the directory itself — the directory alone
     // is already covered by the protected-root check.
+    assertIsolatedPpmHome();
     const secret = join(getPpmDir(), "ppm.db");
     writeFileSync(secret, "secret");
     const res = await del("/fs/delete", { path: secret, permanent: true });
@@ -137,6 +139,7 @@ describe("DELETE /fs/delete", () => {
   });
 
   it("refuses to move a file inside the PPM directory to the trash", async () => {
+    assertIsolatedPpmHome();
     const secret = join(getPpmDir(), "ppm.db");
     writeFileSync(secret, "secret");
     const res = await del("/fs/delete", { path: secret });

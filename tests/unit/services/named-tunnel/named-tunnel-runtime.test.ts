@@ -20,6 +20,10 @@ const FULL_NAMED = {
   accountID: "b".repeat(32),
 };
 
+// Restore, never delete: the bunfig preload's PPM_HOME shields later test
+// files in this process from the real ~/.ppm.
+const ORIGINAL_PPM_HOME = process.env.PPM_HOME;
+
 describe("named-tunnel-runtime", () => {
   let ppmHome: string;
 
@@ -31,7 +35,8 @@ describe("named-tunnel-runtime", () => {
   });
 
   afterEach(() => {
-    delete process.env.PPM_HOME;
+    if (ORIGINAL_PPM_HOME === undefined) delete process.env.PPM_HOME;
+    else process.env.PPM_HOME = ORIGINAL_PPM_HOME;
     _resetPpmDir();
     rmSync(ppmHome, { recursive: true, force: true });
   });

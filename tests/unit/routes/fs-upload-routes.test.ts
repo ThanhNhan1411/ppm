@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fsUploadRoutes } from "../../../src/server/routes/fs-upload.ts";
 import { getPpmDir } from "../../../src/services/ppm-dir.ts";
+import { assertIsolatedPpmHome } from "../../helpers/assert-isolated-ppm-home.ts";
 
 const app = new Hono().route("/fs", fsUploadRoutes);
 let dir: string;
@@ -88,6 +89,7 @@ describe("PUT /fs/upload", () => {
   });
 
   it("refuses the PPM directory subtree", async () => {
+    assertIsolatedPpmHome();
     const target = join(getPpmDir(), "sneaky.txt");
     const res = await put(uploadUrl(target), "x");
     expect(res.status).toBe(403);

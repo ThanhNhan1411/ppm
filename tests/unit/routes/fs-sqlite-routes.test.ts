@@ -8,6 +8,7 @@ import { openTestDb, setDb } from "../../../src/services/db.service.ts";
 import { fsSqliteRoutes } from "../../../src/server/routes/fs-sqlite.ts";
 import { sqliteService } from "../../../src/services/sqlite.service.ts";
 import { getPpmDir } from "../../../src/services/ppm-dir.ts";
+import { assertIsolatedPpmHome } from "../../helpers/assert-isolated-ppm-home.ts";
 
 const app = new Hono().route("/fs/sqlite", fsSqliteRoutes);
 let dir: string;
@@ -124,12 +125,14 @@ describe("arbitrary SQL door", () => {
 
 describe("guards", () => {
   it("refuses the PPM config database", async () => {
+    assertIsolatedPpmHome();
     writeFileSync(resolve(getPpmDir(), "ppm.db"), "");
     const res = await app.request(`/fs/sqlite/tables?path=${q(resolve(getPpmDir(), "ppm.db"))}`);
     expect(res.status).toBe(403);
   });
 
   it("refuses a symlink pointing at the PPM config database", async () => {
+    assertIsolatedPpmHome();
     const secret = resolve(getPpmDir(), "ppm.db");
     writeFileSync(secret, "");
     const link = join(dir, "innocent.db");

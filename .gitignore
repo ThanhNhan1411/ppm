@@ -21,3 +21,6 @@ marketing/
 spike-*
 .spike/
 .rollout-mark
+
+# Throwaway spikes (remote-desktop-b, etc.) - not for commit
+spikes/

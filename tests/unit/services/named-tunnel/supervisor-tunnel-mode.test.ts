@@ -14,6 +14,10 @@ const TEST_PORT = 39879; // outside the Hyper-V reserved range (44620-48715)
 // buildTunnelAttempts writes real artifact files (named-tunnel config/token,
 // quick-tunnel config) via getPpmDir() — isolate under a temp dir so this
 // never touches a real ~/.ppm (which may be a running production instance).
+// Restore, never delete: the bunfig preload's PPM_HOME is what keeps every
+// LATER test file in this process away from the real ~/.ppm. Deleting it here
+// once let a downstream fs-ops fixture overwrite the production ppm.db.
+const ORIGINAL_PPM_HOME = process.env.PPM_HOME;
 let ppmHome: string;
 beforeEach(() => {
   ppmHome = mkdtempSync(resolve(tmpdir(), "ppm-nt-supervisor-mode-"));
@@ -21,7 +25,8 @@ beforeEach(() => {
   _resetPpmDir();
 });
 afterEach(() => {
-  delete process.env.PPM_HOME;
+  if (ORIGINAL_PPM_HOME === undefined) delete process.env.PPM_HOME;
+  else process.env.PPM_HOME = ORIGINAL_PPM_HOME;
   _resetPpmDir();
   rmSync(ppmHome, { recursive: true, force: true });
 });

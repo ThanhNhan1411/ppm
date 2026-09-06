@@ -20,6 +20,10 @@ function captureBroadcasts(): unknown[] {
   return captured;
 }
 
+// Restore, never delete: the bunfig preload's PPM_HOME shields later test
+// files in this process from the real ~/.ppm.
+const ORIGINAL_PPM_HOME = process.env.PPM_HOME;
+
 describe("named-tunnel-setup-confirm", () => {
   let ppmHome: string;
 
@@ -34,7 +38,8 @@ describe("named-tunnel-setup-confirm", () => {
       globalWebSocket.close(openFakeClient as any);
       openFakeClient = null;
     }
-    delete process.env.PPM_HOME;
+    if (ORIGINAL_PPM_HOME === undefined) delete process.env.PPM_HOME;
+    else process.env.PPM_HOME = ORIGINAL_PPM_HOME;
     _resetPpmDir();
     rmSync(ppmHome, { recursive: true, force: true });
   });

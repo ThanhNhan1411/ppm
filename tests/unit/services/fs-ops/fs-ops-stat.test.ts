@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { statPath } from "../../../../src/services/fs-ops/fs-ops-stat.service.ts";
 import { getPpmDir } from "../../../../src/services/ppm-dir.ts";
+import { assertIsolatedPpmHome } from "../../../helpers/assert-isolated-ppm-home.ts";
 
 let dir: string;
 
@@ -53,6 +54,7 @@ describe("statPath", () => {
   });
 
   it("refuses to describe an entry in the PPM directory", async () => {
+    assertIsolatedPpmHome();
     const secret = join(getPpmDir(), "ppm.db");
     writeFileSync(secret, "secret");
     await expect(statPath(secret)).rejects.toMatchObject({ status: 403, code: "EPROTECTED" });

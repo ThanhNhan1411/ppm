@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.18.14] - 2026-09-07
+
+### Added
+- **Send a tab straight to picture-in-picture** — right-click a tab (chat, terminal, editor…) and pick "Open in picture-in-picture" for an always-on-top window in one step; closing it puts the tab back in its strip, with no floating window left behind. Chrome/Edge, desktop.
+
 ## [0.18.13] - 2026-09-07
 
 ### Added

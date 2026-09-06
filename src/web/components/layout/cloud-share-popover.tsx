@@ -44,6 +44,7 @@ export function CloudSharePopover({ onClose, variant = "popover" }: Props) {
   // A live named tunnel means the public URL is already permanent — the
   // "this link changes on restart" pitch would be false.
   const [namedLive, setNamedLive] = useState(false);
+  const [tempUrl, setTempUrl] = useState<string | null>(null);
 
   const reloadStatus = useCallback(async () => {
     try {
@@ -64,6 +65,14 @@ export function CloudSharePopover({ onClose, variant = "popover" }: Props) {
   const handleNamedStatus = useCallback((s: NamedTunnelStatus) => {
     setNamedLive((s.liveMode ?? s.mode) === "named");
   }, []);
+
+  // The port the public URL is served on — a temporary tunnel must target the
+  // same one. `localUrl` is the only place the server reports it to this card.
+  const publicPort = (() => {
+    if (!tunnel?.localUrl) return null;
+    const port = Number(new URL(tunnel.localUrl).port);
+    return Number.isFinite(port) && port > 0 ? port : null;
+  })();
 
   const handleCopy = useCallback((url: string) => {
     void copyToClipboard(url);
@@ -320,8 +329,12 @@ export function CloudSharePopover({ onClose, variant = "popover" }: Props) {
           {/* Separator */}
           <div className="border-t border-border" />
 
-          {/* Custom domain (named tunnel) on/off — only when one has been configured */}
-          <CloudShareNamedTunnelRow onStatus={handleNamedStatus} onTunnelChanged={reloadStatus} />
+          {/* Custom domain: status + optional extra temporary link */}
+          <CloudShareNamedTunnelRow
+            onStatus={handleNamedStatus}
+            publicPort={publicPort}
+            onTempUrl={setTempUrl}
+          />
 
           {/* Local Network URL */}
           {tunnel?.localUrl && (
@@ -358,6 +371,19 @@ export function CloudSharePopover({ onClose, variant = "popover" }: Props) {
                 </div>
               </div>
               <UrlRow url={shareUrl} copied={copied} onCopy={handleCopy} />
+            </div>
+          )}
+
+          {/* Extra one-off link that lives alongside the permanent one */}
+          {tempUrl && tempUrl !== shareUrl && (
+            <div className="space-y-1">
+              <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+                Temporary link
+              </span>
+              <UrlRow url={tempUrl} copied={copied} onCopy={handleCopy} />
+              <p className="text-[11px] text-muted-foreground leading-relaxed">
+                Stops when you press Stop temp link, or when PPM restarts.
+              </p>
             </div>
           )}
 

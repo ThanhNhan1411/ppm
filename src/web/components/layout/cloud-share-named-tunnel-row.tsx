@@ -1,84 +1,105 @@
 import { useCallback, useEffect, useState } from "react";
-import { Globe, Loader2 } from "lucide-react";
+import { Globe, Loader2, Plus, Square } from "lucide-react";
+import { api } from "@/lib/api-client";
 import { namedTunnelApi, type NamedTunnelStatus } from "@/lib/api-named-tunnel";
 
 interface Props {
   /** Called whenever the named-tunnel status is (re)loaded so the parent can adapt its copy. */
   onStatus: (status: NamedTunnelStatus) => void;
-  /** Called while a mode switch settles so the parent can refetch the public URL. */
-  onTunnelChanged: () => void;
+  /** Port the public URL is served on, so a temporary tunnel can target the same thing. */
+  publicPort: number | null;
+  /** Called when a temporary link appears or goes away. */
+  onTempUrl: (url: string | null) => void;
+}
+
+interface TunnelEntry {
+  pid: number;
+  port: number | null;
+  url: string | null;
+  source: "app" | "ppm" | "external";
+  protected: boolean;
 }
 
 /**
- * Compact named-tunnel control for the share popover: turn the custom domain
- * off (back to a temporary link) or back on when one was configured before.
- * First-time setup deliberately stays in the first-run popup / Tunnel Manager —
- * it needs the zone + hostname flow, which does not fit a share card.
+ * Custom-domain row of the share card.
+ *
+ * Deliberately does NOT offer "switch back to a temporary link": that kills the
+ * connector serving the very page the button lives on, so the user never sees
+ * the replacement URL. A temporary link is offered as an ADDITION instead —
+ * a second quick tunnel onto the same port, for one-off sharing without handing
+ * out the permanent hostname. Turning the domain off entirely stays in the
+ * Tunnel Manager, where it can warn about exactly this.
  */
-export function CloudShareNamedTunnelRow({ onStatus, onTunnelChanged }: Props) {
+export function CloudShareNamedTunnelRow({ onStatus, publicPort, onTempUrl }: Props) {
   const [status, setStatus] = useState<NamedTunnelStatus | null>(null);
-  const [busy, setBusy] = useState<"off" | "on" | null>(null);
+  const [temp, setTemp] = useState<TunnelEntry | null>(null);
+  const [busy, setBusy] = useState<"add" | "stop" | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const findTemp = useCallback((list: TunnelEntry[], namedUrl: string | null) => {
+    return list.find((t) =>
+      t.source === "ppm" && !t.protected && t.port === publicPort && t.url && t.url !== namedUrl,
+    ) ?? null;
+  }, [publicPort]);
 
   const load = useCallback(async () => {
     try {
       const s = await namedTunnelApi.status();
       setStatus(s);
       onStatus(s);
-    } catch { /* popover degrades to plain share card */ }
-  }, [onStatus]);
+      const list = await api.get<TunnelEntry[]>("/api/tunnels").catch(() => [] as TunnelEntry[]);
+      const found = findTemp(list, s.hostname ? `https://${s.hostname}` : null);
+      setTemp(found);
+      onTempUrl(found?.url ?? null);
+    } catch { /* share card degrades to the plain view */ }
+  }, [onStatus, onTempUrl, findTemp]);
 
   useEffect(() => { void load(); }, [load]);
 
-  // The supervisor applies a mode switch asynchronously (retunnel → new connector →
-  // status.json). Poll briefly so the card catches up instead of showing the
-  // previous URL until the user reopens it.
-  const settle = useCallback(async (want: "quick" | "named") => {
-    for (let i = 0; i < 12; i++) {
-      await new Promise((r) => setTimeout(r, 2500));
-      const s = await namedTunnelApi.status().catch(() => null);
-      if (s) { setStatus(s); onStatus(s); }
-      onTunnelChanged();
-      if (s?.liveMode === want) break;
-    }
-  }, [onStatus, onTunnelChanged]);
+  const addTemp = useCallback(async () => {
+    if (!publicPort) return;
+    setBusy("add"); setError(null);
+    try {
+      const res = await api.post<{ port: number; url: string }>("/api/tunnels", { port: publicPort });
+      setTemp({ pid: 0, port: publicPort, url: res.url, source: "ppm", protected: false });
+      onTempUrl(res.url);
+      void load(); // pick up the real pid so Stop works
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not create a temporary link");
+    } finally { setBusy(null); }
+  }, [publicPort, onTempUrl, load]);
 
-  const turnOff = useCallback(async () => {
-    setBusy("off"); setError(null);
-    try { await namedTunnelApi.disable(); await settle("quick"); }
-    catch (e) { setError(e instanceof Error ? e.message : "Could not switch to a temporary link"); }
-    finally { setBusy(null); }
-  }, [settle]);
-
-  const turnOn = useCallback(async () => {
-    if (!status?.hostname) return;
-    setBusy("on"); setError(null);
-    try { await namedTunnelApi.setup(status.hostname); await settle("named"); }
-    catch (e) { setError(e instanceof Error ? e.message : "Could not re-enable the custom domain"); }
-    finally { setBusy(null); }
-  }, [status?.hostname, settle]);
+  const stopTemp = useCallback(async () => {
+    if (!temp?.pid) return;
+    setBusy("stop"); setError(null);
+    try {
+      await api.del(`/api/tunnels/${temp.pid}`);
+      setTemp(null);
+      onTempUrl(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not stop the temporary link");
+    } finally { setBusy(null); }
+  }, [temp?.pid, onTempUrl]);
 
   if (!status || status.authEnabled === false || !status.hostname) return null;
-  const live = status.liveMode ?? status.mode;
-  const canReenable = live !== "named" && status.certState === "ok";
-  if (live !== "named" && !canReenable) return null;
+  if ((status.liveMode ?? status.mode) !== "named") return null;
 
   return (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between gap-2 text-xs">
         <div className="flex items-center gap-1.5 min-w-0">
           <Globe className="size-3 text-primary shrink-0" />
-          <span className="text-foreground truncate">
-            {live === "named" ? "Your domain" : "Domain configured"} · {status.hostname}
-          </span>
+          <span className="text-foreground truncate">Your domain · {status.hostname}</span>
         </div>
         <button
-          onClick={live === "named" ? turnOff : turnOn}
-          disabled={busy !== null}
-          className="shrink-0 min-h-11 px-2.5 text-xs rounded-md border border-border hover:bg-muted transition-colors disabled:opacity-50"
-          title={live === "named" ? "Switch back to a temporary link" : "Switch back to your domain"}
+          onClick={temp ? stopTemp : addTemp}
+          disabled={busy !== null || !publicPort}
+          className="shrink-0 min-h-11 px-2.5 flex items-center gap-1 text-xs rounded-md border border-border hover:bg-muted transition-colors disabled:opacity-50"
+          title={temp ? "Stop the temporary link" : "Also expose a temporary link for one-off sharing"}
         >
-          {busy ? <Loader2 className="size-3.5 animate-spin" /> : live === "named" ? "Use temporary link" : "Use my domain"}
+          {busy ? <Loader2 className="size-3.5 animate-spin" />
+            : temp ? <><Square className="size-3" /> Stop temp link</>
+            : <><Plus className="size-3" /> Temp link</>}
         </button>
       </div>
       {status.tunnelWarning && (

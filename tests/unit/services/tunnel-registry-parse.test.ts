@@ -4,6 +4,7 @@ import {
   extractMetricsPort,
   parseQuickTunnelResponse,
   mergeTunnelSources,
+  isAppTunnel,
   type TunnelEntry,
 } from "../../../src/services/tunnel-registry-parse.ts";
 
@@ -131,5 +132,38 @@ describe("mergeTunnelSources", () => {
     });
     expect(merged[0]!.port).toBe(9000);
     expect(merged[0]!.url).toBe("https://y.trycloudflare.com");
+  });
+});
+
+describe("isAppTunnel", () => {
+  const app = { shareUrl: "https://ppm.example.com", tunnelPid: 100, serverPort: 3214 };
+  const base = (over: Partial<TunnelEntry>): TunnelEntry => ({
+    pid: 1, port: null, url: null, source: "external", protected: false, status: "running", ...over,
+  });
+
+  it("protects the supervisor tunnel by pid", () => {
+    expect(isAppTunnel(base({ pid: 100 }), app)).toBe(true);
+  });
+
+  it("protects by public URL even when the pid went stale", () => {
+    expect(isAppTunnel(base({ pid: 999, url: "https://ppm.example.com" }), app)).toBe(true);
+  });
+
+  it("protects an unknown tunnel on the PPM port (stale-pid fallback)", () => {
+    expect(isAppTunnel(base({ pid: 999, port: 3214 }), app)).toBe(true);
+  });
+
+  it("leaves a PPM-spawned temporary tunnel on the same port stoppable", () => {
+    const temp = base({ pid: 777, port: 3214, url: "https://temp.trycloudflare.com", source: "ppm" });
+    expect(isAppTunnel(temp, app)).toBe(false);
+  });
+
+  it("still protects a PPM-sourced entry that IS the supervisor tunnel", () => {
+    const same = base({ pid: 100, port: 3214, source: "ppm" });
+    expect(isAppTunnel(same, app)).toBe(true);
+  });
+
+  it("ignores unrelated tunnels", () => {
+    expect(isAppTunnel(base({ pid: 5, port: 5173 }), app)).toBe(false);
   });
 });

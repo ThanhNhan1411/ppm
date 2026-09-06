@@ -125,6 +125,33 @@ const SOURCE_RANK: Record<TunnelSource, number> = { external: 0, ppm: 1, app: 2 
  * source/protected flag, while url/port/identity are filled from whichever
  * entry has them (higher precedence preferred).
  */
+/** Identity of the supervisor-managed app tunnel, read from status.json + config. */
+export interface AppShare {
+  shareUrl: string | null;
+  tunnelPid: number | null;
+  serverPort: number | null;
+}
+
+/**
+ * Does this cloudflared entry belong to the app/supervisor tunnel? Such a
+ * tunnel is display-only: stopping it from the panel would take the whole app
+ * offline, and the supervisor would just respawn it.
+ *
+ * Matching is protect-by-default (PID, public URL, then the PPM port as a
+ * fallback for a stale `tunnelPid`) with one deliberate exception: a tunnel
+ * this server spawned itself. Running a second, temporary tunnel onto the same
+ * public port is a supported thing to do — sharing a one-off link without
+ * handing out the permanent hostname — and it must stay stoppable from the UI
+ * that created it.
+ */
+export function isAppTunnel(entry: TunnelEntry, app: AppShare): boolean {
+  if (app.tunnelPid != null && entry.pid === app.tunnelPid) return true;
+  if (app.shareUrl && entry.url && entry.url === app.shareUrl) return true;
+  if (entry.source === "ppm") return false;
+  if (app.serverPort != null && entry.port === app.serverPort) return true;
+  return false;
+}
+
 export function mergeTunnelSources(sources: {
   external: TunnelEntry[];
   ppm: TunnelEntry[];

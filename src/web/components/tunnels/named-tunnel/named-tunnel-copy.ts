@@ -85,6 +85,8 @@ export const namedTunnelCopy = {
     relogin: "Đăng nhập lại",
     disable: "Chuyển về quick tunnel",
     disableConfirm: "Bấm lần nữa để xác nhận",
+    disableSelfCut:
+      "Bạn đang mở PPM qua chính tên miền này — tắt nó sẽ ngắt trang ngay và bạn sẽ không kịp thấy link tạm. Mở PPM qua địa chỉ mạng nội bộ rồi tắt.",
     certInvalid: "Cần đăng nhập lại Cloudflare",
     certMismatch: "Chứng chỉ thuộc tài khoản Cloudflare khác — cần đăng nhập lại",
     authDisabled: "Bật xác thực PPM để dùng tên miền riêng",

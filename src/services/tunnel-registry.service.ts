@@ -21,6 +21,8 @@ import {
   extractMetricsPort,
   parseQuickTunnelResponse,
   mergeTunnelSources,
+  isAppTunnel,
+  type AppShare,
   type TunnelEntry,
 } from "./tunnel-registry-parse.ts";
 
@@ -159,12 +161,6 @@ async function recoverUrl(pid: number, metricsAddr: string | null): Promise<stri
 // App/supervisor tunnel identification (protection)
 // ---------------------------------------------------------------------------
 
-interface AppShare {
-  shareUrl: string | null;
-  tunnelPid: number | null;
-  serverPort: number | null;
-}
-
 /** Read the app-share tunnel fresh from status.json each call (guards stale PID). */
 function readAppShare(): AppShare {
   let shareUrl: string | null = null;
@@ -179,15 +175,6 @@ function readAppShare(): AppShare {
   } catch { /* ignore */ }
   const serverPort = (configService.get("port") as number | undefined) ?? null;
   return { shareUrl, tunnelPid, serverPort };
-}
-
-/** A cloudflared entry belongs to the app/supervisor tunnel if it matches by
- *  PID, public URL, or targets the PPM server port. Protect-by-default. */
-function isAppTunnel(entry: TunnelEntry, app: AppShare): boolean {
-  if (app.tunnelPid != null && entry.pid === app.tunnelPid) return true;
-  if (app.shareUrl && entry.url && entry.url === app.shareUrl) return true;
-  if (app.serverPort != null && entry.port === app.serverPort) return true;
-  return false;
 }
 
 // ---------------------------------------------------------------------------

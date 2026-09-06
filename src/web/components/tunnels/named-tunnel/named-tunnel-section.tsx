@@ -23,6 +23,11 @@ export function NamedTunnelSection() {
 
   if (!status) return null; // still loading — avoid flashing empty controls
 
+  // Disabling the domain kills the connector that is serving this page, so the
+  // temporary URL that replaces it can never reach whoever pressed the button.
+  const servedByOwnHostname =
+    !!status.hostname && typeof window !== "undefined" && window.location.hostname === status.hostname;
+
   // "ask-domain" is the popup's own opening question; the section skips it and
   // shows a plain "Set up" button instead, since clicking that button already
   // means "yes".
@@ -133,7 +138,8 @@ export function NamedTunnelSection() {
           {status.mode === "named" && (
             <button
               onClick={handleDisable}
-              disabled={disabling}
+              disabled={disabling || servedByOwnHostname}
+              title={servedByOwnHostname ? c.disableSelfCut : undefined}
               className={`min-h-11 px-3 py-2 rounded-md text-xs transition-colors disabled:opacity-50 ${
                 confirmDisable ? "bg-destructive/15 text-destructive" : "border border-border text-text-secondary hover:bg-surface-elevated"
               }`}
@@ -142,6 +148,11 @@ export function NamedTunnelSection() {
             </button>
           )}
         </div>
+      )}
+      {/* Turning the domain off kills the connector serving this very page, so
+          the replacement link would never reach the user who pressed it. */}
+      {status.mode === "named" && servedByOwnHostname && (
+        <p className="text-[11px] text-text-secondary leading-relaxed">{c.disableSelfCut}</p>
       )}
     </div>
   );

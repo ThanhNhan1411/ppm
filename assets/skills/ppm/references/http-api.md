@@ -41,6 +41,10 @@ _Base URL: `http://localhost:8080` (default; override via `ppm config set port <
 - `POST   /api/ai-resources/duplicate`
 - `DELETE /api/ai-resources`
 
+## /api/chat
+
+- `POST   /api/chat/sessions/read`
+
 ## /api/cloud
 
 - `GET    /api/cloud/status`
@@ -285,6 +289,20 @@ _Base URL: `http://localhost:8080` (default; override via `ppm config set port <
 - `GET    /api/tunnel/port`
 - `POST   /api/tunnel/stop`
 
+## /api/tunnel/named
+
+- `GET    /api/tunnel/named/auth`
+- `GET    /api/tunnel/named/status`
+- `GET    /api/tunnel/named/tunnel`
+- `GET    /api/tunnel/named/auth`
+- `POST   /api/tunnel/named/dismiss`
+- `GET    /api/tunnel/named/tunnel`
+- `GET    /api/tunnel/named/zone`
+- `POST   /api/tunnel/named/login`
+- `POST   /api/tunnel/named/login/cancel`
+- `POST   /api/tunnel/named/setup`
+- `POST   /api/tunnel/named/disable`
+
 ## /api/tunnels
 
 - `GET    /api/tunnels`
@@ -309,4 +327,4 @@ _Base URL: `http://localhost:8080` (default; override via `ppm config set port <
 - `ws://<host>/ws/terminal` — PTY terminal multiplexer
 - `ws://<host>/ws/extensions` — extension host channel
 
-<!-- Generated from src/server/routes/ for PPM v0.18.12 -->
+<!-- Generated from src/server/routes/ for PPM v0.18.13 -->

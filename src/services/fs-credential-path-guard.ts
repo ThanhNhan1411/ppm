@@ -2,6 +2,7 @@ import { resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { getPpmDir } from "./ppm-dir.ts";
 import { getUploadsDir } from "./chat-upload-storage.service.ts";
+import { getBackupsDir } from "./db-backup/db-backup-paths.ts";
 import { realPathOrSelf } from "./fs-ops/fs-real-path.ts";
 
 /**
@@ -11,6 +12,9 @@ import { realPathOrSelf } from "./fs-ops/fs-real-path.ts";
  * cert). Split out of `fs-path-guard.service.ts` so this one seam — "is this
  * a credential path" — stays a single file instead of growing alongside the
  * platform-allowlist and protected-root logic that lives there.
+ *
+ * Three roots, not two: the PPM config DB, `~/.cloudflared`, and the database
+ * snapshot directory, which holds full copies of the first one.
  */
 
 /** Case-insensitive prefix test on Windows/macOS-style paths. */
@@ -50,9 +54,23 @@ export function isCloudflaredDirPath(resolved: string): boolean {
   return isInside(resolved, resolve(homedir(), ".cloudflared"));
 }
 
+/**
+ * True when the path is the database-snapshot directory or anything inside it.
+ *
+ * A snapshot is a byte-for-byte copy of the config database, so it carries the
+ * same provider keys, encrypted accounts, and auth token. In production that
+ * directory deliberately sits OUTSIDE `~/.ppm` (so it survives a wipe of the
+ * PPM directory), which means `isPpmDirPath` does not cover it — without this
+ * branch, moving snapshots out of the PPM directory would have quietly opened
+ * a credential-read hole through the generic file routes.
+ */
+export function isDbBackupsDirPath(resolved: string): boolean {
+  return isInside(resolved, getBackupsDir());
+}
+
 /** True when the path holds credential material a generic file route must never serve or relocate. */
 export function isCredentialPath(resolved: string): boolean {
-  return isPpmDirPath(resolved) || isCloudflaredDirPath(resolved);
+  return isPpmDirPath(resolved) || isCloudflaredDirPath(resolved) || isDbBackupsDirPath(resolved);
 }
 
 /**

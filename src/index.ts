@@ -154,6 +154,9 @@ export async function buildProgram(): Promise<Command> {
   const { registerDbCommands } = await import("./cli/commands/db-cmd.ts");
   registerDbCommands(program);
 
+  const { registerBackupCommands } = await import("./cli/commands/backup-cmd.ts");
+  registerBackupCommands(program);
+
   const { registerBotCommands } = await import("./cli/commands/bot-cmd.ts");
   registerBotCommands(program);
 

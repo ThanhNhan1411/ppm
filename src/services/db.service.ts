@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { mkdirSync, existsSync } from "node:fs";
 import { encrypt, decrypt } from "../lib/account-crypto.ts";
 import { getPpmDir } from "./ppm-dir.ts";
+import { backupDbSync } from "./db-backup/db-backup-sync.ts";
 export const CURRENT_SCHEMA_VERSION = 42;
 
 let db: Database | null = null;
@@ -14,7 +15,8 @@ export function setDbProfile(profile: string | null): void {
   dbProfile = profile;
 }
 
-function getDbPath(): string {
+/** Absolute path of the active database file, honouring the dev profile. */
+export function getDbPath(): string {
   if (dbProfile) return resolve(getPpmDir(), `ppm.${dbProfile}.db`);
   return resolve(getPpmDir(), "ppm.db");
 }
@@ -27,8 +29,34 @@ export function getDb(): Database {
   db = new Database(getDbPath());
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
+  backupBeforeMigrations(db);
   runMigrations(db);
   return db;
+}
+
+/**
+ * Snapshot the database before a schema migration rewrites it.
+ *
+ * Migrations are the riskiest write PPM makes to its own store: they run
+ * automatically on every open, and a crash partway through — or an older
+ * binary opening a newer schema — leaves a file no later version can read.
+ * The hourly snapshot is not enough on its own, because a migration can land
+ * within the same hour as the last one.
+ *
+ * Deliberately synchronous and best-effort: a failure to snapshot must never
+ * stop the server from booting, and must never mask the migration error that
+ * follows it.
+ */
+function backupBeforeMigrations(database: Database): void {
+  const row = database.query("PRAGMA user_version").get() as { user_version: number };
+  if (row.user_version >= CURRENT_SCHEMA_VERSION) return;
+  if (row.user_version === 0) return; // brand-new database — nothing to lose yet
+  try {
+    const result = backupDbSync("premigrate", { sourceDb: database, dbPath: getDbPath() });
+    console.log(`[db] Pre-migration snapshot: ${result.path} (${(result.bytes / 1_048_576).toFixed(1)} MB)`);
+  } catch (e: any) {
+    console.error(`[db] Pre-migration snapshot FAILED (continuing): ${e?.message ?? e}`);
+  }
 }
 
 /** Close the DB (for graceful shutdown or tests) */

@@ -52,6 +52,9 @@ const TUNNEL_URL_REGEX = /https:\/\/(?!api\.)[a-z0-9-]+\.trycloudflare\.com/;
 const NAMED_TUNNEL_READY_REGEX = /Registered tunnel connection/;
 const UPGRADE_CHECK_INTERVAL_MS = 900_000;  // 15min
 const UPGRADE_SKIP_INITIAL_MS = 300_000;    // 5min delay before first check
+const DB_BACKUP_INTERVAL_MS = 3_600_000;    // 1h — the recovery-point target
+const DB_BACKUP_START_DELAY_MS = 30_000;    // let the server settle before the first snapshot
+const DB_BACKUP_STALE_WARN_MS = 21_600_000; // 6h — snapshots stopped happening
 const SELF_REPLACE_TIMEOUT_MS = 30_000;     // 30s to wait for new supervisor
 const EDGE_PROBE_INTERVAL_MS = 10_000;      // the public port is dark while the edge is down — check often
 const SERVER_PORT_MIRROR_TIMEOUT_MS = 30_000; // how long to wait for the server to publish its port
@@ -127,6 +130,7 @@ let healthTimer: ReturnType<typeof setInterval> | null = null;
 let tunnelProbeTimer: ReturnType<typeof setInterval> | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let upgradeCheckTimer: ReturnType<typeof setInterval> | null = null;
+let dbBackupTimer: ReturnType<typeof setInterval> | null = null;
 let upgradeDelayTimer: ReturnType<typeof setTimeout> | null = null;
 let cloudMonitorTimer: ReturnType<typeof setInterval> | null = null;
 let descendantSnapshotTimer: ReturnType<typeof setInterval> | null = null; // win32 only
@@ -936,6 +940,41 @@ export async function spawnTunnel(port: number, generation: number = ++tunnelGen
   return retryTunnelAfterFailure(generation);
 }
 
+// ─── Config-database snapshots ─────────────────────────────────────────
+let dbBackupDelayTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Take one verified snapshot of the config database, then report whether
+ * snapshots are keeping up.
+ *
+ * Failures are logged and swallowed: a backup problem must never take the
+ * server down. The staleness warning exists because a silently-failing backup
+ * is worse than no backup — it is the state where recovery is believed to be
+ * available and is not.
+ */
+async function runDbBackupTick(reason: "hourly" | "start"): Promise<void> {
+  if (shuttingDown) return;
+  try {
+    const { backupDb } = await import("./db-backup/db-backup.service.ts");
+    const result = await backupDb(reason);
+    const mb = (result.bytes / 1_048_576).toFixed(1);
+    const prunedNote = result.pruned.length ? `, pruned ${result.pruned.length}` : "";
+    log("INFO", `DB snapshot (${reason}): ${result.path} ${mb}MB in ${result.ms}ms${prunedNote}`);
+  } catch (e: any) {
+    log("ERROR", `DB snapshot (${reason}) failed: ${e?.message ?? e}`);
+  }
+
+  try {
+    const { newestBackupAgeMs } = await import("./db-backup/db-backup.service.ts");
+    const age = await newestBackupAgeMs();
+    if (age === null) {
+      log("WARN", "DB snapshot: no backups exist yet — the database is currently unrecoverable");
+    } else if (age > DB_BACKUP_STALE_WARN_MS) {
+      log("WARN", `DB snapshot: newest backup is ${Math.round(age / 3_600_000)}h old — recovery point is degraded`);
+    }
+  } catch { /* staleness reporting is advisory only */ }
+}
+
 // ─── Health checks ─────────────────────────────────────────────────────
 function startServerHealthCheck() {
   healthTimer = setInterval(async () => {
@@ -1314,6 +1353,8 @@ async function selfReplace(): Promise<{ success: boolean; error?: string }> {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (upgradeCheckTimer) clearInterval(upgradeCheckTimer);
       if (upgradeDelayTimer) clearTimeout(upgradeDelayTimer);
+      if (dbBackupTimer) clearInterval(dbBackupTimer);
+      if (dbBackupDelayTimer) clearTimeout(dbBackupDelayTimer);
       if (cloudMonitorTimer) clearInterval(cloudMonitorTimer);
       // Disconnect Cloud WS so new supervisor can reconnect cleanly
       try { const { disconnect } = await import("./cloud-ws.service.ts"); disconnect(); } catch {}
@@ -1398,6 +1439,8 @@ async function selfReplace(): Promise<{ success: boolean; error?: string }> {
           if (heartbeatTimer) clearInterval(heartbeatTimer);
           if (upgradeCheckTimer) clearInterval(upgradeCheckTimer);
           if (upgradeDelayTimer) clearTimeout(upgradeDelayTimer);
+          if (dbBackupTimer) clearInterval(dbBackupTimer);
+          if (dbBackupDelayTimer) clearTimeout(dbBackupDelayTimer);
           process.exit(0);
         }
       } catch {}
@@ -1680,6 +1723,8 @@ export function shutdown() {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (upgradeCheckTimer) clearInterval(upgradeCheckTimer);
   if (upgradeDelayTimer) clearTimeout(upgradeDelayTimer);
+  if (dbBackupTimer) clearInterval(dbBackupTimer);
+  if (dbBackupDelayTimer) clearTimeout(dbBackupDelayTimer);
   if (cloudMonitorTimer) clearInterval(cloudMonitorTimer);
   if (descendantSnapshotTimer) clearInterval(descendantSnapshotTimer);
 
@@ -1961,6 +2006,19 @@ export async function runSupervisor(opts: {
       }
     }
   }, RESUME_TICK_MS);
+
+  // Snapshot the config database on a schedule. The supervisor is the only
+  // always-on process, so this is the one place a periodic snapshot survives
+  // both server restarts and crash-backoff windows.
+  //
+  // The start-up snapshot is not redundant with the hourly one: a machine that
+  // is only powered on for short sessions, or a supervisor that sat paused
+  // after exhausting its restart budget, would otherwise take no snapshot at
+  // all for as long as that lasted.
+  dbBackupDelayTimer = setTimeout(() => {
+    void runDbBackupTick("start");
+    dbBackupTimer = setInterval(() => void runDbBackupTick("hourly"), DB_BACKUP_INTERVAL_MS);
+  }, DB_BACKUP_START_DELAY_MS);
 
   // Start upgrade check timer (5min initial delay, then every 15min)
   upgradeDelayTimer = setTimeout(() => {

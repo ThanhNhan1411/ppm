@@ -19,6 +19,7 @@ import { PortalContainerProvider } from "@/components/ui/portal-container-contex
 import { TITLEBAR_HEIGHT } from "./window-chrome-contract";
 import { useWindowBodyElement } from "./use-window-body-element";
 import { WindowPipPlaceholder } from "./window-pip-placeholder";
+import { isPipOnlyWindow } from "./window-pip-registry";
 import { WindowSkinChrome } from "./window-skin-chrome";
 import { windowZIndex, type Bounds, type Rect } from "./window-geometry";
 import { useWindowStore, type WindowRuntimeState } from "./window-store";
@@ -120,6 +121,8 @@ export function FloatingWindow({
     movable: !maximized,
   });
 
+  const hiddenHost = Boolean(pip) && isPipOnlyWindow(win.id);
+
   return (
     <div
       ref={rootRef}
@@ -135,6 +138,10 @@ export function FloatingWindow({
         focused ? "shadow-2xl shadow-black/40" : "shadow-lg shadow-black/20",
         // Transitions are for maximize/restore only; during a gesture they would lag the pointer.
         gesturing ? "transition-none" : "transition-[transform,width,height] duration-150 motion-reduce:transition-none",
+        // A window opened only to carry a tab into PiP is never shown: the user asked for a
+        // PiP, not a window. `hidden` and not an unmount — the body must stay connected, or
+        // the PiP host has nowhere to put the tab back.
+        hiddenHost && "hidden",
       )}
     >
       <WindowSkinChrome
@@ -158,7 +165,7 @@ export function FloatingWindow({
         onClose={close}
       />
 
-      {pip && <WindowPipPlaceholder pip={pip} minimized={minimized} />}
+      {pip && !hiddenHost && <WindowPipPlaceholder pip={pip} minimized={minimized} />}
 
       {!maximized && !minimized && (
         <WindowResizeHandles bind={(handle) => bindResize(handle) as Record<string, unknown>} />

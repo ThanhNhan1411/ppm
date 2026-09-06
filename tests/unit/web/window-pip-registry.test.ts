@@ -9,8 +9,12 @@ import { describe, it, expect, afterEach } from "bun:test";
 import {
   publishWindowSlot,
   windowSlot,
+  whenWindowSlot,
   setWindowPip,
   windowPip,
+  markPipOnlyWindow,
+  isPipOnlyWindow,
+  clearPipOnlyWindow,
 } from "../../../src/web/components/floating-window/window-pip-registry";
 import type { PipHandle } from "../../../src/web/components/floating-window/pip/pip-host";
 
@@ -21,6 +25,7 @@ afterEach(() => {
   for (const id of ["w1", "w2"]) {
     publishWindowSlot(id, null);
     setWindowPip(id, null);
+    clearPipOnlyWindow(id);
   }
 });
 
@@ -61,5 +66,46 @@ describe("window PiP handles", () => {
     setWindowPip("w1", null);
     expect(windowPip("w1")).toBeNull();
     expect(windowPip("w2")).toBe(h2);
+  });
+});
+
+describe("waiting for a window to publish its body", () => {
+  it("resolves immediately for a window that already published", async () => {
+    const el = fakeEl("body");
+    publishWindowSlot("w1", el);
+    expect(await whenWindowSlot("w1", 50)).toBe(el);
+  });
+
+  it("resolves once the frame mounts a commit later", async () => {
+    const el = fakeEl("late");
+    const waiting = whenWindowSlot("w1", 500);
+    // What the frame's layout effect does after the store opened the window.
+    setTimeout(() => publishWindowSlot("w1", el), 5);
+    expect(await waiting).toBe(el);
+  });
+
+  it("is not answered by another window publishing", async () => {
+    const waiting = whenWindowSlot("w1", 60);
+    publishWindowSlot("w2", fakeEl("other"));
+    expect(await waiting).toBeNull();
+  });
+
+  it("gives up rather than hanging when the window never mounts", async () => {
+    expect(await whenWindowSlot("w1", 30)).toBeNull();
+  });
+});
+
+describe("pip-only host windows", () => {
+  it("is off by default and set per window", () => {
+    expect(isPipOnlyWindow("w1")).toBe(false);
+    markPipOnlyWindow("w1");
+    expect(isPipOnlyWindow("w1")).toBe(true);
+    expect(isPipOnlyWindow("w2")).toBe(false);
+  });
+
+  it("clears so a reused id is not hidden forever", () => {
+    markPipOnlyWindow("w1");
+    clearPipOnlyWindow("w1");
+    expect(isPipOnlyWindow("w1")).toBe(false);
   });
 });

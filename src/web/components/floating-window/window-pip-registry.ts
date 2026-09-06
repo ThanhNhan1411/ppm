@@ -24,6 +24,52 @@ const listeners = new Set<() => void>();
 export function publishWindowSlot(windowId: string, el: HTMLElement | null): void {
   if (el) slots.set(windowId, el);
   else slots.delete(windowId);
+  for (const notify of listeners) notify();
+}
+
+/**
+ * Resolve once a window has published its body, or `null` if it never does.
+ *
+ * A window opened to host a picture-in-picture request exists in the store before React has
+ * mounted its frame, so the element the PiP host needs does not exist yet in the click
+ * handler that created it. Waiting is safe: transient activation survives a commit, it is
+ * consuming it twice that the browser refuses.
+ */
+export function whenWindowSlot(windowId: string, timeoutMs = 2000): Promise<HTMLElement | null> {
+  const existing = windowSlot(windowId);
+  if (existing) return Promise.resolve(existing);
+  return new Promise((resolve) => {
+    const settle = (el: HTMLElement | null) => {
+      listeners.delete(check);
+      clearTimeout(timer);
+      resolve(el);
+    };
+    const check = () => {
+      const el = windowSlot(windowId);
+      if (el) settle(el);
+    };
+    const timer = setTimeout(() => settle(null), timeoutMs);
+    listeners.add(check);
+  });
+}
+
+/**
+ * Windows that exist only to carry a tab into picture-in-picture: the frame keeps them off
+ * screen while PiP is up, and closing PiP closes the window, so the tab goes straight back
+ * to its tab strip instead of stranding an empty window the user never asked for.
+ */
+const pipOnly = new Set<string>();
+
+export function markPipOnlyWindow(windowId: string): void {
+  pipOnly.add(windowId);
+}
+
+export function isPipOnlyWindow(windowId: string): boolean {
+  return pipOnly.has(windowId);
+}
+
+export function clearPipOnlyWindow(windowId: string): void {
+  pipOnly.delete(windowId);
 }
 
 /** The body element of a mounted window, or null. */

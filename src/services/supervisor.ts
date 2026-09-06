@@ -102,6 +102,10 @@ let lastSpawnMode: TunnelMode = "quick";
 // Set once the named probe has already tried a restart-and-hope; a second
 // consecutive failure then warns and stops instead of looping kills forever.
 let namedProbeRestartAttempted = false;
+// Two distinct states, deliberately worded differently: the first is "we are
+// looking into it", the second is "we tried and it is still dark".
+const NAMED_WARNING_CHECKING = "checking the connection to your domain…";
+const NAMED_WARNING_UNREACHABLE = "hostname unreachable — check DNS/Cloudflare";
 
 // Module-level refs for softStop (needs access to respawn args)
 let _serverArgs: string[] = [];
@@ -1079,6 +1083,12 @@ function startTunnelProbe() {
           if (readStatus().tunnelWarning != null) updateStatus({ tunnelWarning: null });
           return;
         case "watch":
+          // Say something after ~1 minute even though the connector is left
+          // alone until the 5-minute threshold: an unreachable hostname that
+          // reports nothing is indistinguishable from a working one.
+          if (action.warnEarly && readStatus().tunnelWarning == null) {
+            updateStatus({ tunnelWarning: NAMED_WARNING_CHECKING });
+          }
           return;
         case "restart-once":
           log("WARN", "Named tunnel unreachable at threshold — restarting the connector once");
@@ -1095,7 +1105,7 @@ function startTunnelProbe() {
           // Already tried a restart — the hostname is still dark. Never loop
           // further and never null the pinned URL; just surface the warning.
           log("WARN", "Named tunnel still unreachable after one restart — warning and stopping (shareUrl stays pinned)");
-          updateStatus({ tunnelWarning: "hostname unreachable — check DNS/Cloudflare" });
+          updateStatus({ tunnelWarning: NAMED_WARNING_UNREACHABLE });
           return;
       }
       return;

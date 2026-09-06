@@ -5,6 +5,7 @@ import { randomBytes } from "node:crypto";
 import { VERSION } from "../version.ts";
 import { configService } from "./config.service.ts";
 import { getPpmDir } from "./ppm-dir.ts";
+import { readStatus } from "./supervisor-state.ts";
 
 const authFile = () => resolve(getPpmDir(), "cloud-auth.json");
 const deviceFile = () => resolve(getPpmDir(), "cloud-device.json");
@@ -374,6 +375,27 @@ export async function listDevices(): Promise<DeviceInfo[]> {
 // ─── Heartbeat ──────────────────────────────────────────────────────────
 
 /** Send a single heartbeat to cloud (non-blocking, logs errors) */
+/**
+ * Tunnel health as last observed by the supervisor, in the shape the cloud
+ * heartbeat sends. `degraded` means the tunnel process is up but its public
+ * hostname did not answer as us — the device is reachable locally, the link
+ * may not be.
+ */
+function describeTunnelHealth(): { status: "online" | "degraded"; tunnel_mode?: string; tunnel_warning?: string } {
+  try {
+    const s = readStatus();
+    const warning = typeof s.tunnelWarning === "string" && s.tunnelWarning ? s.tunnelWarning : null;
+    const mode = s.tunnelMode === "named" || s.tunnelMode === "quick" ? s.tunnelMode : undefined;
+    return {
+      status: warning ? "degraded" : "online",
+      ...(mode ? { tunnel_mode: mode } : {}),
+      ...(warning ? { tunnel_warning: warning } : {}),
+    };
+  } catch {
+    return { status: "online" }; // never let a status-file hiccup stop the heartbeat
+  }
+}
+
 export async function sendHeartbeat(tunnelUrl: string): Promise<boolean> {
   const device = getCloudDevice();
   if (!device) return false;
@@ -385,7 +407,10 @@ export async function sendHeartbeat(tunnelUrl: string): Promise<boolean> {
       body: JSON.stringify({
         secret_key: device.secret_key,
         tunnel_url: tunnelUrl,
-        status: "online",
+        // A heartbeat that always says "online" makes the cloud link redirect
+        // into a hostname that stopped answering minutes ago. Report what the
+        // supervisor actually observed so the permanent link can say why.
+        ...describeTunnelHealth(),
         name: device.name,
       }),
     });

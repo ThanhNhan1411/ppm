@@ -1,7 +1,8 @@
-import { WifiOff, ServerOff, RefreshCw } from "lucide-react";
+import { WifiOff, ServerOff, RefreshCw, Home } from "lucide-react";
 import { useState } from "react";
 import { useConnectionStore } from "@/stores/connection-store";
 import { getCachedNamedHostname } from "@/components/tunnels/named-tunnel/use-named-tunnel-setup";
+import { getLastKnownLocalUrl } from "@/lib/last-known-local-url";
 
 const CLOUD_URL = "https://cloud.ppm.sh";
 
@@ -18,6 +19,12 @@ function isTunnelDomain(): boolean {
   return host.endsWith(".trycloudflare.com") || host === getCachedNamedHostname();
 }
 
+/** Reached through the user's own permanent hostname, not a temporary one. */
+function isNamedDomain(): boolean {
+  const cached = getCachedNamedHostname();
+  return !!cached && window.location.hostname === cached;
+}
+
 export function ConnectionLostOverlay() {
   const showOverlay = useConnectionStore((s) => s.showOverlay);
   const [retrying, setRetrying] = useState(false);
@@ -25,6 +32,8 @@ export function ConnectionLostOverlay() {
   if (!showOverlay) return null;
 
   const isTunnel = isTunnelDomain();
+  const isNamed = isNamedDomain();
+  const localUrl = getLastKnownLocalUrl();
 
   async function handleRetry() {
     setRetrying(true);
@@ -58,22 +67,42 @@ export function ConnectionLostOverlay() {
 
         <div className="space-y-2">
           <h2 className="text-xl font-semibold text-foreground">
-            {isTunnel ? "Connection Lost" : "Server Unreachable"}
+            {isNamed ? "Domain Not Responding" : isTunnel ? "Connection Lost" : "Server Unreachable"}
           </h2>
           <p className="text-sm text-muted-foreground leading-relaxed">
-            {isTunnel
+            {isNamed
+              // A named hostname never rotates, so "the URL changed" — true for a
+              // quick tunnel — would send the user hunting for a new link that
+              // does not exist. The address is fine; something behind it is not.
+              ? "This address stays the same, so keep it. The machine may be asleep, offline, or restarting — it will answer again on this same URL."
+              : isTunnel
               ? "The tunnel appears to have closed. The server may have restarted with a new URL."
               : "Cannot connect to the PPM server. It may have stopped or is restarting."}
           </p>
         </div>
 
         <div className="flex flex-col gap-3">
+          {/* Same machine, same network: the LAN address bypasses Cloudflare
+              entirely, so it still works when only the hostname is broken. */}
+          {isTunnel && localUrl && (
+            <a
+              href={localUrl}
+              className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+            >
+              <Home className="h-4 w-4" />
+              Open on local network
+            </a>
+          )}
           {isTunnel && (
             <a
               href={CLOUD_URL}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center justify-center rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+              className={`inline-flex items-center justify-center rounded-md px-4 py-2.5 text-sm font-medium transition-colors ${
+                localUrl
+                  ? "border border-border text-foreground hover:bg-accent"
+                  : "bg-primary text-primary-foreground hover:bg-primary/90"
+              }`}
             >
               Open PPM Cloud
             </a>

@@ -23,7 +23,9 @@ export interface NamedProbeState {
 
 export type NamedProbeAction =
   | { type: "healthy" }
-  | { type: "watch" }
+  /** Counting a failure. `warnEarly` marks the tick that should surface a
+   *  soft "checking the connection" notice without touching the connector. */
+  | { type: "watch"; warnEarly: boolean }
   | { type: "restart-once" }
   | { type: "warn-and-stop" };
 
@@ -53,7 +55,11 @@ export function publicHostnameIsOurs(publicId: unknown, localId: unknown): boole
  *
  * - `healthy` → both counters reset to a clean slate (the only place
  *   `restartAttempted` ever goes back to `false`).
- * - unhealthy below `threshold` → `watch` (just count, no action).
+ * - unhealthy below `threshold` → `watch`. Acting on a dark hostname is
+ *   deliberately slow (a flaky minute must not kill a working connector), but
+ *   *saying nothing* for that long is a different decision: `watch` carries
+ *   `warnEarly` on the tick that crosses `earlyWarnAt`, so the UI can show
+ *   "checking the connection" while the restart budget is still untouched.
  * - unhealthy at/above `threshold`, first time → `restart-once` (kill +
  *   respawn the connector; arms `restartAttempted` so this never repeats
  *   until a healthy observation clears it).
@@ -64,6 +70,7 @@ export function decideNamedProbeAction(
   healthy: boolean,
   state: NamedProbeState,
   threshold: number,
+  earlyWarnAt = 2,
 ): NamedProbeDecision {
   if (healthy) {
     return { action: { type: "healthy" }, nextState: { failCount: 0, restartAttempted: false } };
@@ -71,7 +78,13 @@ export function decideNamedProbeAction(
 
   const failCount = state.failCount + 1;
   if (failCount < threshold) {
-    return { action: { type: "watch" }, nextState: { failCount, restartAttempted: state.restartAttempted } };
+    // Only on the crossing tick: re-writing the same warning every 30s would
+    // rewrite status.json forever for no new information.
+    const warnEarly = failCount === earlyWarnAt;
+    return {
+      action: { type: "watch", warnEarly },
+      nextState: { failCount, restartAttempted: state.restartAttempted },
+    };
   }
 
   if (!state.restartAttempted) {

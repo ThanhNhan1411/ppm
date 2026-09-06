@@ -6,6 +6,7 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { CloudAliasRow } from "./cloud-alias-row";
 import { CloudShareNamedTunnelRow } from "./cloud-share-named-tunnel-row";
 import type { NamedTunnelStatus } from "@/lib/api-named-tunnel";
+import { rememberLocalUrl } from "@/lib/last-known-local-url";
 
 interface CloudStatus {
   logged_in: boolean;
@@ -54,6 +55,7 @@ export function CloudSharePopover({ onClose, variant = "popover" }: Props) {
       ]);
       setCloud(cloudRes);
       setTunnel(tunnelRes);
+      rememberLocalUrl(tunnelRes.localUrl);
     } catch { /* ignore */ }
   }, []);
 

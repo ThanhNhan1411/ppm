@@ -5,6 +5,34 @@ import {
 
 const THRESHOLD = 3; // small threshold — the arithmetic is the same at any size
 
+describe("decideNamedProbeAction early warning", () => {
+  test("flags exactly the crossing tick, so the same warning is not rewritten every cycle", () => {
+    let state: NamedProbeState = { failCount: 0, restartAttempted: false };
+    const seen: boolean[] = [];
+    for (let i = 0; i < 5; i++) {
+      const { action, nextState } = decideNamedProbeAction(false, state, 10, 2);
+      seen.push(action.type === "watch" && action.warnEarly);
+      state = nextState;
+    }
+    expect(seen).toEqual([false, true, false, false, false]);
+  });
+
+  test("a healthy tick resets the counter, so a later outage warns again", () => {
+    let state: NamedProbeState = { failCount: 0, restartAttempted: false };
+    state = decideNamedProbeAction(false, state, 10, 2).nextState;
+    state = decideNamedProbeAction(false, state, 10, 2).nextState; // warned
+    state = decideNamedProbeAction(true, state, 10, 2).nextState;  // recovered
+    state = decideNamedProbeAction(false, state, 10, 2).nextState;
+    const { action } = decideNamedProbeAction(false, state, 10, 2);
+    expect(action.type === "watch" && action.warnEarly).toBe(true);
+  });
+
+  test("never warns early once the threshold is reached (that path acts instead)", () => {
+    const { action } = decideNamedProbeAction(false, { failCount: 9, restartAttempted: false }, 10, 2);
+    expect(action.type).toBe("restart-once");
+  });
+});
+
 describe("publicHostnameIsOurs", () => {
   test("same instanceId on both sides is ours", () => {
     expect(publicHostnameIsOurs("abc", "abc")).toBe(true);
@@ -28,7 +56,7 @@ describe("decideNamedProbeAction", () => {
     let state: NamedProbeState = { failCount: 0, restartAttempted: false };
     for (let i = 1; i < THRESHOLD; i++) {
       const { action, nextState } = decideNamedProbeAction(false, state, THRESHOLD);
-      expect(action).toEqual({ type: "watch" });
+      expect(action.type).toBe("watch");
       expect(nextState).toEqual({ failCount: i, restartAttempted: false });
       state = nextState;
     }

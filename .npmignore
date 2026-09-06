@@ -10,6 +10,7 @@ codex-junction-skill-probe.ts
 *-poc.ts
 spike-*
 .spike/
+spikes/
 *.err
 .out.txt
 

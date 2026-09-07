@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Named tunnel setup is in English** like the rest of the interface — the first-run popup and Tunnel Manager section shipped in Vietnamese by mistake.
+
 ## [0.18.14] - 2026-09-07
 
 ### Added

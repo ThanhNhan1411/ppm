@@ -98,7 +98,7 @@ export async function startLogin(opts: { relogin?: boolean } = {}): Promise<Logi
       // itself failed to run, so cert.pem is left untouched and the user
       // gets a clear, retryable error instead of an unwanted fresh login.
       if (liveCheck === "unreachable") {
-        setTerminal("error", "không kết nối được Cloudflare để kiểm tra đăng nhập — thử lại");
+        setTerminal("error", "could not reach Cloudflare to check the sign-in — try again");
         return getLoginSnapshot();
       }
 
@@ -117,7 +117,7 @@ export async function startLogin(opts: { relogin?: boolean } = {}): Promise<Logi
       renameCertAside();
     }
   } else {
-    // Explicit ?relogin=1 — the user deliberately pressed "Đăng nhập lại",
+    // Explicit ?relogin=1 — the user deliberately pressed "Sign in again",
     // so this renames unconditionally regardless of network reachability.
     renameCertAside();
   }

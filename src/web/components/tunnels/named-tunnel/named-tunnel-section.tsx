@@ -52,10 +52,10 @@ export function NamedTunnelSection() {
     setDisabling(true);
     try {
       await namedTunnelApi.disable();
-      toast.success("Đã chuyển về quick tunnel");
+      toast.success("Switched back to a quick tunnel");
       await t.refreshStatus();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Không chuyển được về quick tunnel");
+      toast.error(e instanceof Error ? e.message : "Could not switch back to a quick tunnel");
     } finally {
       setDisabling(false);
     }

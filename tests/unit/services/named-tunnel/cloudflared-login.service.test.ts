@@ -129,7 +129,7 @@ describe("cloudflared-login.service", () => {
     expect(snapshot).toEqual({
       state: "error",
       url: null,
-      message: "không kết nối được Cloudflare để kiểm tra đăng nhập — thử lại",
+      message: "could not reach Cloudflare to check the sign-in — try again",
     });
     expect(existsSync(process.env.TUNNEL_ORIGIN_CERT!)).toBe(true); // a network blip must never discard a working credential
   });

@@ -360,10 +360,11 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
         if (att.textContent) parts.push(att.textContent);
       }
 
-      // Server-uploaded file references. Images carrying their own payload are left out:
-      // they ride along with the message, so naming the path too would only invite the model
-      // to spend a round trip re-reading what it already has.
-      const fileAtts = attachments.filter((a) => a.serverPath && !a.imageData);
+      // Server-uploaded file references. Images keep theirs even though the payload rides
+      // along with the message: the transcript is what the chat re-renders from, and the path
+      // is the only thing in it that a thumbnail can be drawn from. The model has no reason to
+      // spend a round trip reading a file it was already handed.
+      const fileAtts = attachments.filter((a) => a.serverPath);
       if (fileAtts.length > 0) {
         const fileRefs = fileAtts.map((a) => a.serverPath!).join("\n");
         parts.push(

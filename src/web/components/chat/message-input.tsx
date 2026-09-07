@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect, memo, type KeyboardEvent, typ
 import { ArrowUp, Square, Paperclip, Loader2, Mic, MicOff, Zap, ListOrdered, Clock, Bot, X } from "lucide-react";
 import { useVoiceInput } from "@/hooks/use-voice-input";
 import { api, projectUrl, getAuthToken } from "@/lib/api-client";
+import { downscaleImage } from "@/lib/image-resize";
 import { randomId } from "@/lib/utils";
 import { ownsGlobalShortcut } from "@/lib/owns-global-shortcut";
 import { SEND_TO_CHAT_EVENT, SEND_TO_CHAT_ACK_EVENT, type SendToChatDetail } from "@/lib/send-to-chat";
@@ -17,6 +18,22 @@ import { fetchSlashItems, clearSlashItemsCache } from "@/lib/slash-items-cache";
 import type { FileNode } from "../../../types/project";
 import { useFileStore } from "@/stores/file-store";
 
+/** Base64 payload for an image file, or undefined when it cannot be read. */
+async function readImageData(file: File): Promise<{ data: string; mediaType: string } | undefined> {
+  try {
+    const buf = await file.arrayBuffer();
+    let binary = "";
+    const bytes = new Uint8Array(buf);
+    const CHUNK = 0x8000; // btoa on the whole array blows the argument limit on large images
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return { data: btoa(binary), mediaType: file.type || "image/png" };
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ChatAttachment {
   id: string;
   name: string;
@@ -27,6 +44,14 @@ export interface ChatAttachment {
   serverPath?: string;
   /** Inline text content (e.g. terminal output) — no upload needed */
   textContent?: string;
+  /**
+   * Base64 payload for an image, sent as part of the message itself.
+   *
+   * Passing the path instead would make the model spend a whole extra round trip calling Read
+   * to fetch it, and every round trip re-sends the entire transcript. The uploaded copy is
+   * still kept, so removing the payload from a transcript later stays recoverable.
+   */
+  imageData?: { data: string; mediaType: string };
   status: "uploading" | "ready" | "error";
 }
 
@@ -466,32 +491,45 @@ export const MessageInput = memo(function MessageInput({
   /** Process files — always uploads to server. Path resolution only happens via @ picker. */
   const processFiles = useCallback(
     async (files: File[]) => {
-      for (const file of files) {
+      for (const original of files) {
         const id = randomId();
-        const isImg = isImageFile(file);
-        const previewUrl = isImg ? URL.createObjectURL(file) : undefined;
+        const isImg = isImageFile(original);
 
         const att: ChatAttachment = {
           id,
-          name: file.name,
-          file,
+          name: original.name,
+          file: original,
           isImage: isImg,
-          previewUrl,
+          previewUrl: isImg ? URL.createObjectURL(original) : undefined,
           status: "uploading",
         };
 
         setAttachments((prev) => [...prev, att]);
 
-        // Upload in background
-        uploadFile(file).then((serverPath) => {
+        // Shrink first, so the upload, the preview and the message all carry the same
+        // already-reduced image — an oversized original must not reach the transcript.
+        void (async () => {
+          const file = isImg ? (await downscaleImage(original)).file : original;
+          const [serverPath, imageData] = await Promise.all([
+            uploadFile(file),
+            isImg ? readImageData(file) : Promise.resolve(undefined),
+          ]);
           setAttachments((prev) =>
             prev.map((a) =>
               a.id === id
-                ? { ...a, serverPath: serverPath ?? undefined, status: serverPath ? "ready" : "error" }
+                ? {
+                    ...a,
+                    file,
+                    serverPath: serverPath ?? undefined,
+                    imageData,
+                    // An image can still be sent inline when the upload failed; a plain file
+                    // has nothing left to send without its path.
+                    status: serverPath || imageData ? "ready" : "error",
+                  }
                 : a,
             ),
           );
-        });
+        })();
       }
       (mobileTextareaRef.current ?? textareaRef.current)?.focus();
     },

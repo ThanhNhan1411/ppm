@@ -56,7 +56,7 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
   );
 
   // Pending message to send after WS connects (replaces unreliable setTimeout)
-  const pendingSendRef = useRef<{ content: string; permissionMode?: string } | null>(null);
+  const pendingSendRef = useRef<{ content: string; permissionMode?: string; images?: Array<{ data: string; mediaType: string }> } | null>(null);
 
   // Drag-and-drop state
   const [isDragging, setIsDragging] = useState(false);
@@ -142,9 +142,9 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
   // Flush pending message once WS connects (replaces unreliable setTimeout)
   useEffect(() => {
     if (isConnected && pendingSendRef.current) {
-      const { content, permissionMode: pm } = pendingSendRef.current;
+      const { content, permissionMode: pm, images: pendingImages } = pendingSendRef.current;
       pendingSendRef.current = null;
-      sendMessage(content, { permissionMode: pm });
+      sendMessage(content, { permissionMode: pm, ...(pendingImages?.length && { images: pendingImages }) });
     }
   }, [isConnected, sendMessage]);
 
@@ -360,8 +360,10 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
         if (att.textContent) parts.push(att.textContent);
       }
 
-      // Server-uploaded file references
-      const fileAtts = attachments.filter((a) => a.serverPath);
+      // Server-uploaded file references. Images carrying their own payload are left out:
+      // they ride along with the message, so naming the path too would only invite the model
+      // to spend a round trip re-reading what it already has.
+      const fileAtts = attachments.filter((a) => a.serverPath && !a.imageData);
       if (fileAtts.length > 0) {
         const fileRefs = fileAtts.map((a) => a.serverPath!).join("\n");
         parts.push(
@@ -380,7 +382,8 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
   const handleSend = useCallback(
     async (content: string, attachments: ChatAttachment[] = [], priority?: MessagePriority) => {
       const fullContent = buildMessageWithAttachments(content, attachments);
-      if (!fullContent.trim()) return;
+      const images = attachments.map((a) => a.imageData).filter((d) => !!d);
+      if (!fullContent.trim() && images.length === 0) return;
 
       if (!sessionId) {
         try {
@@ -394,14 +397,14 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
           setSessionId(session.id);
           setProviderId(session.providerId);
           // Queue message — will be sent by effect when WS reports isConnected
-          pendingSendRef.current = { content: fullContent, permissionMode };
+          pendingSendRef.current = { content: fullContent, permissionMode, images };
           return;
         } catch (e) {
           console.error("Failed to create session:", e);
           return;
         }
       }
-      sendMessage(fullContent, { permissionMode, priority });
+      sendMessage(fullContent, { permissionMode, priority, ...(images.length > 0 && { images }) });
     },
     [sessionId, providerId, projectName, sendMessage, buildMessageWithAttachments, permissionMode, metadata],
   );

@@ -1,5 +1,6 @@
 import { readImageDimensions } from "./image-dimensions.ts";
 import { base64ByteLength, imagePlaceholderText } from "../shared/tool-result-content.ts";
+import { MAX_IMAGE_DIMENSION } from "../shared/image-limits.ts";
 
 /**
  * Auditing and removal of image payloads inside a Claude Code session transcript.
@@ -28,7 +29,7 @@ import { base64ByteLength, imagePlaceholderText } from "../shared/tool-result-co
  * Comparisons here are `>=` rather than `>` for that reason: treating 2000px as acceptable
  * hides the one image the API is rejecting and makes a cleanup look like a no-op.
  */
-export const MANY_IMAGE_DIMENSION_LIMIT = 2000;
+export const MANY_IMAGE_DIMENSION_LIMIT = MAX_IMAGE_DIMENSION;
 
 /** Base64 characters decoded to inspect a header — a JPEG frame can sit behind EXIF. */
 const HEADER_CHARS = 4096;

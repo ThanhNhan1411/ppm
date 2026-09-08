@@ -471,6 +471,27 @@ export const MessageInput = memo(function MessageInput({
     onExternalPathsConsumed?.();
   }, [externalPaths]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  /** Delete an upload the user removed before sending. Best effort — nothing depends on it. */
+  const discardUpload = useCallback(
+    async (serverPath: string) => {
+      if (!projectName) return;
+      const filename = serverPath.split(/[\\/]/).pop();
+      if (!filename) return;
+      try {
+        const headers: HeadersInit = {};
+        const token = getAuthToken();
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        await fetch(`${projectUrl(projectName)}/chat/uploads/${encodeURIComponent(filename)}`, {
+          method: "DELETE",
+          headers,
+        });
+      } catch {
+        // An orphaned file is not worth surfacing to the user.
+      }
+    },
+    [projectName],
+  );
+
   /** Upload a single file to the server, return server path */
   const uploadFile = useCallback(
     async (file: File): Promise<string | null> => {
@@ -526,18 +547,24 @@ export const MessageInput = memo(function MessageInput({
         try {
           const outcome = isImg ? await downscaleImage(original) : null;
           const file = outcome?.file ?? original;
+          // Point the thumbnail at the reduced file and let the original go. It is the larger
+          // of the two and nothing needs it once the resize is done, but it stayed alive until
+          // the message was sent because the preview still referenced it.
+          const previewUrl = isImg && file !== original ? URL.createObjectURL(file) : undefined;
           const serverPath = await uploadFile(file);
           const inlineable = outcome ? outcome.kind !== "asis" : false;
           const imageData = inlineable ? await readImageData(file) : undefined;
           const withinPayloadCap =
             !!imageData && imageData.data.length <= INLINE_IMAGE_LIMITS.maxBase64PerImage;
 
+          if (previewUrl && att.previewUrl) URL.revokeObjectURL(att.previewUrl);
           setAttachments((prev) =>
             prev.map((a) =>
               a.id === id
                 ? {
                     ...a,
                     file,
+                    ...(previewUrl && { previewUrl }),
                     serverPath: serverPath ?? undefined,
                     imageData: withinPayloadCap ? imageData : undefined,
                     resized: outcome?.to ? { from: outcome.from!, to: outcome.to } : undefined,
@@ -563,9 +590,12 @@ export const MessageInput = memo(function MessageInput({
     setAttachments((prev) => {
       const att = prev.find((a) => a.id === id);
       if (att?.previewUrl) URL.revokeObjectURL(att.previewUrl);
+      // Uploads are never swept, because chat history points at them indefinitely, so one
+      // abandoned before it was ever sent would sit there with nothing referencing it.
+      if (att?.serverPath) void discardUpload(att.serverPath);
       return prev.filter((a) => a.id !== id);
     });
-  }, []);
+  }, [discardUpload]);
 
   /** Execute the actual send (called directly or after uploads complete) */
   const executeSend = useCallback(() => {

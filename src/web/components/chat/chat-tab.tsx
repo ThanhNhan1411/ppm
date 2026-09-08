@@ -3,6 +3,7 @@ import { Loader2, Upload, X } from "lucide-react";
 import { toast } from "sonner";
 import { api, projectUrl } from "@/lib/api-client";
 import { selectInlineImages } from "@/lib/image-resize-limits";
+import { splitAttachmentMarkers } from "@/lib/attachment-marker-split";
 import { useChat } from "@/hooks/use-chat";
 import { useUsage } from "@/hooks/use-usage";
 import { useTabStore } from "@/stores/tab-store";
@@ -351,7 +352,11 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
 
   /** Build message content with file references and inline text snippets prepended */
   const buildMessageWithAttachments = useCallback(
-    (content: string, attachments: ChatAttachment[]): string => {
+    (
+      content: string,
+      attachments: ChatAttachment[],
+      inlineImages: Array<{ data: string; mediaType: string }> = [],
+    ): string => {
       if (attachments.length === 0) return content;
 
       const parts: string[] = [];
@@ -368,16 +373,20 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
       // An image sent inline says so in the marker. A bare path in a user message reads as an
       // invitation to open it, and a model that takes it pays for the same picture twice —
       // once inline, once as a tool result, both replayed on every later turn.
-      for (const a of attachments) {
-        if (a.serverPath && a.imageData) {
-          parts.push(`[Attached image (contents included in this message): ${a.serverPath}]`);
-        }
+      //
+      // Which marker an image gets follows the payloads that are actually going out, not
+      // `imageData` alone: the per-message caps can leave one behind, and announcing that its
+      // contents are included would hand the model neither the picture nor a reason to open
+      // the file. `inlineImages` defaults to none, so a caller that sends no payloads at all
+      // (the edit-fork path takes only text) gets the plain markers throughout.
+      const { inlineImagePaths, pathOnlyPaths } = splitAttachmentMarkers(attachments, inlineImages);
+      for (const path of inlineImagePaths) {
+        parts.push(`[Attached image (contents included in this message): ${path}]`);
       }
-      const pathOnly = attachments.filter((a) => a.serverPath && !a.imageData);
-      if (pathOnly.length > 0) {
-        const fileRefs = pathOnly.map((a) => a.serverPath!).join("\n");
+      if (pathOnlyPaths.length > 0) {
+        const fileRefs = pathOnlyPaths.join("\n");
         parts.push(
-          pathOnly.length === 1
+          pathOnlyPaths.length === 1
             ? `[Attached file: ${fileRefs}]`
             : `[Attached files:\n${fileRefs}\n]`,
         );
@@ -391,8 +400,8 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
 
   const handleSend = useCallback(
     async (content: string, attachments: ChatAttachment[] = [], priority?: MessagePriority) => {
-      const fullContent = buildMessageWithAttachments(content, attachments);
       const images = selectInlineImages(attachments);
+      const fullContent = buildMessageWithAttachments(content, attachments, images);
       // Providers that take a file rather than a payload (codex) read these instead.
       const imagePaths = attachments.filter((a) => a.isImage && a.serverPath).map((a) => a.serverPath!);
       if (!fullContent.trim() && images.length === 0) return;

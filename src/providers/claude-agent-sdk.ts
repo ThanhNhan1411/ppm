@@ -166,7 +166,7 @@ function parseUsageLimitReset(text: string): { text?: string; atMs?: number } | 
 }
 
 /** Build a MessageParam with optional image content blocks */
-function buildMessageParam(
+export function buildMessageParam(
   text: string,
   images?: Array<{ data: string; mediaType: string }>,
 ): { role: 'user'; content: string | any[] } {
@@ -1104,10 +1104,13 @@ export class ClaudeAgentSdkProvider implements AIProvider {
 
       crashRetryLoop: for (;;) {
       try {
-      // Streaming input: create message channel and persistent query
+      // Streaming input: create message channel and persistent query.
+      // The images ride on this first message too: a session's opening turn is the common
+      // case for attaching one (new tab, paste, send), and leaving them off here sent the
+      // model a bare path instead — the round trip the caller passed them in to avoid.
       const firstMsg = {
         type: 'user' as const,
-        message: buildMessageParam(message),
+        message: buildMessageParam(message, opts?.images),
         parent_tool_use_id: null,
         session_id: sessionId,
       };

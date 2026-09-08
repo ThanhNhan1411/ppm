@@ -1,9 +1,6 @@
 import { describe, test, expect } from "bun:test";
-import {
-  MAX_IMAGE_DIMENSION,
-  estimateImageTokens,
-  fitWithin,
-} from "../../../src/shared/image-limits.ts";
+import { MAX_IMAGE_DIMENSION, fitWithin } from "../../../src/shared/image-limits.ts";
+import { ATTACHMENT_MAX_DIMENSION } from "../../../src/web/lib/image-resize.ts";
 
 describe("fitWithin", () => {
   test("leaves an image that is already under the cap alone", () => {
@@ -61,27 +58,14 @@ describe("fitWithin", () => {
   });
 });
 
-describe("estimateImageTokens", () => {
-  // Cost tracks pixels, which is why trimming 2000px to 1999px saves nothing and a real
-  // reduction has to cut the area.
-  test("follows the area rule", () => {
-    expect(estimateImageTokens(2000, 1500)).toBe(4000);
-    expect(estimateImageTokens(1000, 750)).toBe(1000);
+// The attachment target must stay under the API's ceiling, or a downscaled image would still
+// be refused — and the refusal outlives the turn, since the transcript replays it.
+describe("attachment target", () => {
+  test("sits below the API ceiling", () => {
+    expect(ATTACHMENT_MAX_DIMENSION).toBeLessThan(MAX_IMAGE_DIMENSION);
   });
 
-  test("shaving one pixel off the cap saves nothing worth counting", () => {
-    const before = estimateImageTokens(2000, 1500);
-    const after = estimateImageTokens(1999, 1499);
-    expect((before - after) / before).toBeLessThan(0.01);
-  });
-
-  test("halving the longest side quarters the cost", () => {
-    const full = estimateImageTokens(2000, 1500);
-    const half = estimateImageTokens(1000, 750);
-    expect(half / full).toBeCloseTo(0.25, 2);
-  });
-
-  test("zero for a degenerate size", () => {
-    expect(estimateImageTokens(0, 100)).toBe(0);
+  test("an image at the attachment target is not re-encoded for one pixel", () => {
+    expect(fitWithin(ATTACHMENT_MAX_DIMENSION, 900, ATTACHMENT_MAX_DIMENSION + 1)).toBeNull();
   });
 });

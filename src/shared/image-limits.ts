@@ -14,17 +14,6 @@
 export const MAX_IMAGE_DIMENSION = 2000;
 
 /**
- * Roughly how many tokens an image occupies, by Anthropic's area rule.
- *
- * Cost tracks pixels, not bytes: a well-compressed 2000×1500 screenshot is small on disk and
- * expensive in context, which is why downscaling is worth doing even when the file looks fine.
- */
-export function estimateImageTokens(width: number, height: number): number {
-  if (!(width > 0) || !(height > 0)) return 0;
-  return Math.round((width * height) / 750);
-}
-
-/**
  * Dimensions that bring an image under the cap, or null when it is already small enough.
  *
  * Scales the longest side to one pixel below the cap and takes the other side with it, so the

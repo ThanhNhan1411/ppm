@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { Loader2, Upload, X } from "lucide-react";
 import { toast } from "sonner";
 import { api, projectUrl } from "@/lib/api-client";
+import { selectInlineImages } from "@/lib/image-resize-limits";
 import { useChat } from "@/hooks/use-chat";
 import { useUsage } from "@/hooks/use-usage";
 import { useTabStore } from "@/stores/tab-store";
@@ -56,7 +57,7 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
   );
 
   // Pending message to send after WS connects (replaces unreliable setTimeout)
-  const pendingSendRef = useRef<{ content: string; permissionMode?: string; images?: Array<{ data: string; mediaType: string }> } | null>(null);
+  const pendingSendRef = useRef<{ content: string; permissionMode?: string; images?: Array<{ data: string; mediaType: string }>; imagePaths?: string[] } | null>(null);
 
   // Drag-and-drop state
   const [isDragging, setIsDragging] = useState(false);
@@ -142,9 +143,9 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
   // Flush pending message once WS connects (replaces unreliable setTimeout)
   useEffect(() => {
     if (isConnected && pendingSendRef.current) {
-      const { content, permissionMode: pm, images: pendingImages } = pendingSendRef.current;
+      const { content, permissionMode: pm, images: pendingImages, imagePaths: pendingPaths } = pendingSendRef.current;
       pendingSendRef.current = null;
-      sendMessage(content, { permissionMode: pm, ...(pendingImages?.length && { images: pendingImages }) });
+      sendMessage(content, { permissionMode: pm, ...(pendingImages?.length && { images: pendingImages }), ...(pendingPaths?.length && { imagePaths: pendingPaths }) });
     }
   }, [isConnected, sendMessage]);
 
@@ -360,15 +361,23 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
         if (att.textContent) parts.push(att.textContent);
       }
 
-      // Server-uploaded file references. Images keep theirs even though the payload rides
-      // along with the message: the transcript is what the chat re-renders from, and the path
-      // is the only thing in it that a thumbnail can be drawn from. The model has no reason to
-      // spend a round trip reading a file it was already handed.
-      const fileAtts = attachments.filter((a) => a.serverPath);
-      if (fileAtts.length > 0) {
-        const fileRefs = fileAtts.map((a) => a.serverPath!).join("\n");
+      // Server-uploaded file references. An image keeps its path even when the payload rides
+      // along with the message, because the transcript is what the chat re-renders from and
+      // the path is the only thing in it a thumbnail can be drawn from.
+      //
+      // An image sent inline says so in the marker. A bare path in a user message reads as an
+      // invitation to open it, and a model that takes it pays for the same picture twice —
+      // once inline, once as a tool result, both replayed on every later turn.
+      for (const a of attachments) {
+        if (a.serverPath && a.imageData) {
+          parts.push(`[Attached image (contents included in this message): ${a.serverPath}]`);
+        }
+      }
+      const pathOnly = attachments.filter((a) => a.serverPath && !a.imageData);
+      if (pathOnly.length > 0) {
+        const fileRefs = pathOnly.map((a) => a.serverPath!).join("\n");
         parts.push(
-          fileAtts.length === 1
+          pathOnly.length === 1
             ? `[Attached file: ${fileRefs}]`
             : `[Attached files:\n${fileRefs}\n]`,
         );
@@ -383,7 +392,9 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
   const handleSend = useCallback(
     async (content: string, attachments: ChatAttachment[] = [], priority?: MessagePriority) => {
       const fullContent = buildMessageWithAttachments(content, attachments);
-      const images = attachments.map((a) => a.imageData).filter((d) => !!d);
+      const images = selectInlineImages(attachments);
+      // Providers that take a file rather than a payload (codex) read these instead.
+      const imagePaths = attachments.filter((a) => a.isImage && a.serverPath).map((a) => a.serverPath!);
       if (!fullContent.trim() && images.length === 0) return;
 
       if (!sessionId) {
@@ -398,14 +409,14 @@ export function ChatTab({ metadata, tabId }: ChatTabProps) {
           setSessionId(session.id);
           setProviderId(session.providerId);
           // Queue message — will be sent by effect when WS reports isConnected
-          pendingSendRef.current = { content: fullContent, permissionMode, images };
+          pendingSendRef.current = { content: fullContent, permissionMode, images, imagePaths };
           return;
         } catch (e) {
           console.error("Failed to create session:", e);
           return;
         }
       }
-      sendMessage(fullContent, { permissionMode, priority, ...(images.length > 0 && { images }) });
+      sendMessage(fullContent, { permissionMode, priority, ...(images.length > 0 && { images }), ...(imagePaths.length > 0 && { imagePaths }) });
     },
     [sessionId, providerId, projectName, sendMessage, buildMessageWithAttachments, permissionMode, metadata],
   );

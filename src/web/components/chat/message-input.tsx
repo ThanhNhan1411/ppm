@@ -3,6 +3,7 @@ import { ArrowUp, Square, Paperclip, Loader2, Mic, MicOff, Zap, ListOrdered, Clo
 import { useVoiceInput } from "@/hooks/use-voice-input";
 import { api, projectUrl, getAuthToken } from "@/lib/api-client";
 import { downscaleImage } from "@/lib/image-resize";
+import { INLINE_IMAGE_LIMITS } from "@/lib/image-resize-limits";
 import { randomId } from "@/lib/utils";
 import { ownsGlobalShortcut } from "@/lib/owns-global-shortcut";
 import { SEND_TO_CHAT_EVENT, SEND_TO_CHAT_ACK_EVENT, type SendToChatDetail } from "@/lib/send-to-chat";
@@ -18,17 +19,24 @@ import { fetchSlashItems, clearSlashItemsCache } from "@/lib/slash-items-cache";
 import type { FileNode } from "../../../types/project";
 import { useFileStore } from "@/stores/file-store";
 
-/** Base64 payload for an image file, or undefined when it cannot be read. */
+/**
+ * Base64 payload for an image file, or undefined when it cannot be read.
+ *
+ * Reads through FileReader rather than assembling the string by hand: a phone photo is
+ * millions of characters, and building it in chunks on the main thread freezes the composer
+ * for as long as it takes.
+ */
 async function readImageData(file: File): Promise<{ data: string; mediaType: string } | undefined> {
   try {
-    const buf = await file.arrayBuffer();
-    let binary = "";
-    const bytes = new Uint8Array(buf);
-    const CHUNK = 0x8000; // btoa on the whole array blows the argument limit on large images
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-    }
-    return { data: btoa(binary), mediaType: file.type || "image/png" };
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ""));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+    const comma = dataUrl.indexOf(",");
+    const data = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+    return data ? { data, mediaType: file.type || "image/png" } : undefined;
   } catch {
     return undefined;
   }
@@ -52,6 +60,8 @@ export interface ChatAttachment {
    * still kept, so removing the payload from a transcript later stays recoverable.
    */
   imageData?: { data: string; mediaType: string };
+  /** Dimensions before and after downscaling, when one happened — surfaced in the chip. */
+  resized?: { from: { width: number; height: number }; to: { width: number; height: number } };
   status: "uploading" | "ready" | "error";
 }
 
@@ -508,12 +518,20 @@ export const MessageInput = memo(function MessageInput({
 
         // Shrink first, so the upload, the preview and the message all carry the same
         // already-reduced image — an oversized original must not reach the transcript.
-        void (async () => {
-          const file = isImg ? (await downscaleImage(original)).file : original;
-          const [serverPath, imageData] = await Promise.all([
-            uploadFile(file),
-            isImg ? readImageData(file) : Promise.resolve(undefined),
-          ]);
+        //
+        // Only a `scaled` or `inlineable` result is attached inline. An image that could not
+        // be measured or re-encoded travels by path alone: sending unverified dimensions
+        // inline risks a payload the API refuses, and that refusal outlives the turn, since
+        // the transcript replays it into every later one.
+        try {
+          const outcome = isImg ? await downscaleImage(original) : null;
+          const file = outcome?.file ?? original;
+          const serverPath = await uploadFile(file);
+          const inlineable = outcome ? outcome.kind !== "asis" : false;
+          const imageData = inlineable ? await readImageData(file) : undefined;
+          const withinPayloadCap =
+            !!imageData && imageData.data.length <= INLINE_IMAGE_LIMITS.maxBase64PerImage;
+
           setAttachments((prev) =>
             prev.map((a) =>
               a.id === id
@@ -521,15 +539,20 @@ export const MessageInput = memo(function MessageInput({
                     ...a,
                     file,
                     serverPath: serverPath ?? undefined,
-                    imageData,
-                    // An image can still be sent inline when the upload failed; a plain file
-                    // has nothing left to send without its path.
-                    status: serverPath || imageData ? "ready" : "error",
+                    imageData: withinPayloadCap ? imageData : undefined,
+                    resized: outcome?.to ? { from: outcome.from!, to: outcome.to } : undefined,
+                    // An image can still be sent inline when the upload failed; anything
+                    // else has nothing left to send without its path.
+                    status: serverPath || withinPayloadCap ? "ready" : "error",
                   }
                 : a,
             ),
           );
-        })();
+        } catch {
+          // Nothing here may leave an attachment stuck on "uploading" — both the send button
+          // and the auto-send effect wait on that state, so a swallowed throw hangs the composer.
+          setAttachments((prev) => prev.map((a) => (a.id === id ? { ...a, status: "error" } : a)));
+        }
       }
       (mobileTextareaRef.current ?? textareaRef.current)?.focus();
     },
